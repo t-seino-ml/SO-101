@@ -13,3 +13,12 @@ img/
 
 # Generated previews, captures and training runs
 outputs/
+
+# Ultralytics training runs
+runs/
+# Generated datasets and crops
+data/
+
+# Ultralytics pretrained checkpoints, downloaded on demand
+*.pt
+weights/

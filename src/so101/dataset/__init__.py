@@ -1,12 +1,11 @@
-"""Teleoperation recording and LeRobot dataset handling. Phase 3 - not implemented yet.
+"""Training data: block crops, synthetic scenes, and LeRobot datasets.
 
-Intended scope:
-
-- record leader/follower joint states plus camera frames into a LeRobot dataset
-- inspect and prune episodes before training
-- publish to the Hugging Face Hub if the dataset is worth sharing
-
-LeRobot ships `lerobot-record`, `lerobot-dataset-viz` and `lerobot-edit-dataset`;
-this package should wrap them with this rig's ports and calibration rather than
-reimplementing them. See docs/03-dataset.md.
+- `blocks`   cut the coloured cubes out of the source photos, with alpha, so they
+             can be composited onto any background
+- (planned)  synthetic scene generation for the detector
+- (planned)  teleoperation recording and LeRobot dataset handling
 """
+
+from .blocks import COLOR_CLASSES, extract_blocks
+
+__all__ = ["COLOR_CLASSES", "extract_blocks"]

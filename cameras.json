@@ -4,13 +4,17 @@
     "width": 800,
     "height": 600,
     "fps": 20,
-    "fourcc": "MJPG"
+    "fourcc": "MJPG",
+    "exposure": "auto",
+    "auto_wb": true
   },
   "side": {
     "name": "EMEET",
     "width": 800,
     "height": 600,
     "fps": 20,
-    "fourcc": "MJPG"
+    "fourcc": "MJPG",
+    "exposure": "auto",
+    "auto_wb": true
   }
 }

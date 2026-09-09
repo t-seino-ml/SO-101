@@ -9,7 +9,26 @@ dependencies = [
     # DirectShow device names, so a camera can be identified by name instead of by
     # an index Windows is free to reshuffle.
     "pygrabber; sys_platform == 'win32'",
+    "ultralytics",
+    # Named directly so [tool.uv.sources] applies: uv only honours source overrides
+    # for a project's own dependencies, not for ones pulled in transitively.
+    "torch",
+    "torchvision",
+    # Inverse kinematics from the URDF. LeRobot's RobotKinematics uses placo, which
+    # publishes no Windows wheels; ikpy is pure Python and solves this arm exactly.
+    "ikpy",
 ]
+
+# LeRobot pulls the CPU build of torch. This machine has an RTX 4060, and both
+# YOLO and ACT training are impractical without it.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [dependency-groups]
 dev = ["pytest"]

@@ -35,13 +35,17 @@ class CameraStream:
     """Reads one camera in a background thread and publishes the latest frame."""
 
     def __init__(self, spec, width=None, height=None, fps=None, fourcc=None,
-                 name=None, warmup_s=WARMUP_S):
+                 name=None, warmup_s=WARMUP_S, exposure=None, auto_wb=None,
+                 wb_temperature=None):
         self.spec = spec
         self.width = width
         self.height = height
         self.fps = fps
         self.fourcc = fourcc
         self.warmup_s = warmup_s
+        self.exposure = exposure
+        self.auto_wb = auto_wb
+        self.wb_temperature = wb_temperature
         self.name = name or str(spec)
         self.format = None  # what the camera settled on, filled in by start()
         self.index = None  # resolved in start(), never from the reader thread
@@ -64,7 +68,8 @@ class CameraStream:
         # DirectShow COM, and two reader threads doing that concurrently deadlocks.
         self.index = resolve(self.spec)
         self._capture = open_camera(self.index, self.width, self.height, self.fps,
-                                    self.fourcc)
+                                    self.fourcc, self.exposure, self.auto_wb,
+                                    self.wb_temperature)
         self.format = actual_format(self._capture)
         self._stop.clear()
         self._started_at = time.perf_counter()
@@ -158,6 +163,18 @@ class CameraSet:
         """`specs` maps a role ("overhead", "side") to a camera name or index."""
         return cls({role: CameraStream(spec, width, height, fps, fourcc, name=role,
                                        warmup_s=warmup_s)
+                    for role, spec in specs.items()})
+
+    @classmethod
+    def from_config(cls, specs=None, warmup_s=WARMUP_S):
+        """Build from cameras.json, honouring each camera's own settings."""
+        from .config import load
+
+        specs = load() if specs is None else specs
+        return cls({role: CameraStream(spec.name, spec.width, spec.height, spec.fps,
+                                       spec.fourcc, name=role, warmup_s=warmup_s,
+                                       exposure=spec.exposure, auto_wb=spec.auto_wb,
+                                       wb_temperature=spec.wb_temperature)
                     for role, spec in specs.items()})
 
     def start(self):

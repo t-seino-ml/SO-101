@@ -30,6 +30,12 @@ class CameraSpec:
     height: int | None = None
     fps: int | None = None
     fourcc: str | None = None
+    # log2 seconds, DirectShow convention: -8 is 1/256 s. "auto" calibrates once
+    # at startup and then locks, which is what a rig that moves between tables
+    # wants. None leaves the camera's own auto-exposure running.
+    exposure: float | str | None = None
+    auto_wb: bool | None = None
+    wb_temperature: int | None = None
 
     def index(self):
         """The OpenCV index this camera currently sits at."""

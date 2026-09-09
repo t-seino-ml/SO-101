@@ -130,7 +130,107 @@ def resolve(spec):
     return matches[0]
 
 
-def open_camera(spec, width=None, height=None, fps=None, fourcc=None):
+# Exposure search: log2 seconds, brightest first.
+EXPOSURE_CANDIDATES = (-4, -5, -6, -7, -8, -9, -10, -11)
+TARGET_MEAN_V = 130.0
+MAX_BLOWN_FRACTION = 0.02     # highlights at 251+
+MAX_CRUSHED_FRACTION = 0.05   # shadows below 20
+SETTLE_FRAMES = 12
+
+
+def _frame_stats(capture, frames=SETTLE_FRAMES):
+    image = None
+    for _ in range(frames):
+        ok, candidate = capture.read()
+        if ok and candidate is not None:
+            image = candidate
+    if image is None:
+        return None
+    value = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)[:, :, 2]
+    return {
+        "mean": float(value.mean()),
+        "blown": float((value > 250).mean()),
+        "crushed": float((value < 20).mean()),
+    }
+
+
+def calibrate_exposure(capture, target_mean=TARGET_MEAN_V, verbose=False):
+    """Pick a fixed exposure that suits whatever this scene actually looks like.
+
+    A hardcoded exposure is only right for the table it was tuned on: -8 suits pale
+    wood and leaves a dark surface unusable. Auto-exposure is worse - it rewrites
+    the image whenever the scene changes, so the same block is a different colour
+    from frame to frame.
+
+    So: sweep once at startup, keep the setting that lands nearest a mid-grey mean
+    without blowing highlights or crushing shadows, then lock it. Stable during a
+    session, and it adapts when the rig moves to a different table.
+
+    Returns the chosen exposure, or None if the camera ignored the setting.
+    """
+    capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+
+    scored = []
+    for exposure in EXPOSURE_CANDIDATES:
+        capture.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        stats = _frame_stats(capture)
+        if stats is None:
+            continue
+        # Clipping is worse than being off-target: it destroys information.
+        penalty = abs(stats["mean"] - target_mean)
+        if stats["blown"] > MAX_BLOWN_FRACTION:
+            penalty += 1000 * (stats["blown"] - MAX_BLOWN_FRACTION)
+        if stats["crushed"] > MAX_CRUSHED_FRACTION:
+            penalty += 1000 * (stats["crushed"] - MAX_CRUSHED_FRACTION)
+        scored.append((penalty, exposure, stats))
+        if verbose:
+            print(f"    exposure {exposure:>4}: mean {stats['mean']:6.1f}  "
+                  f"blown {100 * stats['blown']:5.2f}%  "
+                  f"crushed {100 * stats['crushed']:5.2f}%  score {penalty:7.1f}")
+
+    if not scored:
+        return None
+    _, best, _ = min(scored, key=lambda item: item[0])
+    capture.set(cv2.CAP_PROP_EXPOSURE, best)
+    _frame_stats(capture)
+    return best
+
+
+def apply_exposure(capture, exposure=None, auto_wb=None, wb_temperature=None):
+    """Pin exposure and white balance so the image does not drift.
+
+    Auto-exposure rewrites the scene every time the lighting or the contents of
+    the frame change: the wooden table blows out to near white and the blocks lose
+    most of their saturation, which is measurable - median saturation on the
+    overhead camera goes from 10 at auto to 123 with exposure pinned at -8.
+
+    A detector should still be trained to survive lighting changes, but that is a
+    separate concern from letting the camera silently change its own gain.
+
+    DirectShow uses 0.25 for manual exposure and 0.75 for auto, and expresses
+    exposure as log2 seconds, so -8 is 1/256 s.
+
+    White balance is a different story and is best left on. Switching auto white
+    balance off freezes whatever gains the camera happened to hold, and
+    CAP_PROP_WB_TEMPERATURE does not reach them: on the side camera, locking moved
+    the mean R-B from +25 to +124 and no temperature setting brought it back. The
+    frame-to-frame variation auto white balance introduces is smaller than the cast
+    that locking it produces, and training augments white balance anyway.
+    """
+    if exposure == "auto":
+        exposure = calibrate_exposure(capture)
+    elif exposure is not None:
+        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        capture.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    if auto_wb is not None:
+        capture.set(cv2.CAP_PROP_AUTO_WB, 1 if auto_wb else 0)
+    if wb_temperature is not None:
+        capture.set(cv2.CAP_PROP_WB_TEMPERATURE, wb_temperature)
+    return exposure
+
+
+def open_camera(spec, width=None, height=None, fps=None, fourcc=None,
+                exposure=None, auto_wb=None, wb_temperature=None):
     """Open a camera by name or index, optionally requesting a stream format.
 
     FOURCC is set before the frame size: DirectShow picks the stream format first,
@@ -168,6 +268,10 @@ def open_camera(spec, width=None, height=None, fps=None, fourcc=None):
         # requested size has to differ from the default: asking for MJPG at the
         # same resolution leaves DirectShow on the original uncompressed format.
         capture.read()
+    # Exposure and white balance go last: rebuilding the graph for a new format
+    # discards them, and calibrating against the default resolution would measure
+    # the wrong image anyway.
+    apply_exposure(capture, exposure, auto_wb, wb_temperature)
     return capture
 
 

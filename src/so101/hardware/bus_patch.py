@@ -33,6 +33,7 @@ NUM_RETRY = int(os.environ.get("SO101_SERIAL_RETRIES", "3"))
 PACKET_TIMEOUT_MARGIN_MS = float(os.environ.get("SO101_PACKET_TIMEOUT_MS", "5"))
 ENCODER_MIN, ENCODER_MAX = 0, 4095
 
+_ping = MotorsBus.ping
 _record_ranges = MotorsBus.record_ranges_of_motion
 _sync_read = MotorsBus._sync_read
 _read = MotorsBus._read
@@ -52,6 +53,18 @@ def _read_retrying(self, addr, length, motor_id, *, num_retry=0, **kwargs):
 def _write_retrying(self, addr, length, motor_id, value, *, num_retry=0, **kwargs):
     return _write(self, addr, length, motor_id, value,
                   num_retry=max(num_retry, NUM_RETRY), **kwargs)
+
+
+def _ping_retrying(self, motor, num_retry=0, raise_on_error=False):
+    """Retry the connect-time roll call.
+
+    `_assert_motors_exist` pings each motor once with no retries and refuses to
+    connect if any is missing. One dropped packet out of six therefore aborts the
+    whole connection, reporting a servo as absent when it answers perfectly well a
+    moment later - which is exactly what happened to shoulder_lift here.
+    """
+    return _ping(self, motor, num_retry=max(num_retry, NUM_RETRY),
+                 raise_on_error=raise_on_error)
 
 
 def _record_ranges_clamped(self, motors=None, display_values=True):
@@ -84,6 +97,7 @@ def _set_packet_timeout(self, packet_length):
 # its constructor, so this has to happen before any bus is created.
 feetech.patch_setPacketTimeout = _set_packet_timeout
 
+MotorsBus.ping = _ping_retrying
 MotorsBus.record_ranges_of_motion = _record_ranges_clamped
 MotorsBus._sync_read = _sync_read_retrying
 MotorsBus._read = _read_retrying
