@@ -1,0 +1,9 @@
+[project]
+name = "so-101"
+version = "0.1.0"
+description = "SO-101 arm bring-up and operation checks"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "lerobot[feetech]",
+    "pyserial",
+]

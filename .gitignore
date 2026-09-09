@@ -1,0 +1,12 @@
+# uv environment (recreate with `uv sync`)
+.venv/
+
+__pycache__/
+*.py[cod]
+
+# Machine-specific state, not shared between setups
+servo_baseline.json
+last_recording.json
+
+# Photos and other local assets
+img/
