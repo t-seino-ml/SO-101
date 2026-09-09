@@ -27,7 +27,7 @@ winget install --id=astral-sh.uv -e
 リポジトリを取得して環境を構築します。Python 3.11 と LeRobot 一式（PyTorch 含む、約 3GB）が入ります。
 
 ```bash
-git clone https://github.com/<user>/SO-101.git
+git clone https://github.com/t-seino-ml/SO-101.git
 cd SO-101
 uv sync
 ```
