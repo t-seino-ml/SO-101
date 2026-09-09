@@ -10,3 +10,6 @@ last_recording.json
 
 # Photos and other local assets
 img/
+
+# Generated previews, captures and training runs
+outputs/

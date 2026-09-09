@@ -6,7 +6,13 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "lerobot[feetech]",
     "pyserial",
+    # DirectShow device names, so a camera can be identified by name instead of by
+    # an index Windows is free to reshuffle.
+    "pygrabber; sys_platform == 'win32'",
 ]
+
+[dependency-groups]
+dev = ["pytest"]
 
 [build-system]
 requires = ["hatchling"]

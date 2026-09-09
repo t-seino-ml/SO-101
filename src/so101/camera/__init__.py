@@ -1,14 +1,25 @@
-"""Camera discovery, calibration and capture. Phase 2 - not implemented yet.
+"""Camera discovery, capture and role configuration.
 
-Intended scope:
-
-- enumerate the attached cameras and keep a stable identity for each one, the way
-  `hardware.ports` does for serial ports, so a config does not break when Windows
-  renumbers devices
-- capture at a fixed resolution and frame rate alongside the 120 Hz control loop,
-  without stalling it
-- expose frames to `dataset` for recording and to `policy` for inference
-
-LeRobot already ships `lerobot-find-cameras`; start there rather than writing
-enumeration from scratch. See docs/02-camera.md.
+Cameras are identified by DirectShow device name rather than by OpenCV index,
+because Windows reorders indices - the same problem `hardware.ports` solves for
+serial ports. Capture runs on a background thread per camera and publishes only
+the newest frame, so the 120 Hz control loop never waits on a 20 fps camera.
 """
+
+from .capture import CameraSet, CameraStream, Frame
+from .config import CameraSpec, load, to_lerobot
+from .discovery import (
+    CameraInfo,
+    actual_format,
+    device_names,
+    discover,
+    open_camera,
+    probe,
+    resolve,
+)
+
+__all__ = [
+    "CameraInfo", "CameraSet", "CameraSpec", "CameraStream", "Frame",
+    "actual_format", "device_names", "discover", "load", "open_camera", "probe",
+    "resolve", "to_lerobot",
+]

@@ -9,12 +9,12 @@ SO-101 ロボットアームを使った模倣学習アプリケーションの�
 | フェーズ | 内容 | 状態 | ドキュメント |
 |---|---|---|---|
 | 1 | **セットアップ** — 接続確認、キャリブレーション、テレオペレーション | ✅ 完了 | [docs/01-setup.md](docs/01-setup.md) |
-| 2 | **カメラ認識** — カメラ検出、同期、映像取得 | 未着手 | [docs/02-camera.md](docs/02-camera.md) |
+| 2 | **カメラ認識** — カメラ検出、同期、映像取得 | ✅ 完了 | [docs/02-camera.md](docs/02-camera.md) |
 | 3 | **データセット記録** — 操作の記録、LeRobot データセット化 | 未着手 | [docs/03-dataset.md](docs/03-dataset.md) |
 | 4 | **モデル構築・推論** — ポリシー学習、実機での自律動作 | 未着手 | [docs/04-training.md](docs/04-training.md) |
 | 5 | **UI・統合アプリ** — 全体を 1 つのアプリケーションに統合 | 未着手 | [docs/05-app.md](docs/05-app.md) |
 
-フェーズ 2 以降のドキュメントは**計画**であり、実装・検証は行っていません。
+フェーズ 3 以降のドキュメントは**計画**であり、実装・検証は行っていません。
 
 ## セットアップ
 
@@ -40,6 +40,7 @@ uv sync
 uv run scripts/ports.py            # シリアルポートの検出
 uv run scripts/scan_servos.py      # サーボの ping
 uv run scripts/diag.py             # 電圧・温度・可動域などの健全性診断
+uv run scripts/find_cameras.py     # カメラの検出とプレビュー保存
 ```
 
 キャリブレーションとテレオペレーションの手順は [docs/01-setup.md](docs/01-setup.md) を参照してください。
@@ -55,7 +56,7 @@ SO-101/
 ├── docs/                  フェーズごとのドキュメント
 ├── src/so101/
 │   ├── hardware/          サーボバス、ポート検出、LeRobot パッチ（実装済み）
-│   ├── camera/            カメラ検出・取得（フェーズ 2）
+│   ├── camera/            カメラ検出・取得（実装済み）
 │   ├── dataset/           記録・データセット化（フェーズ 3）
 │   ├── policy/            学習・推論（フェーズ 4）
 │   └── ui/                画面部品（フェーズ 5）
@@ -64,7 +65,9 @@ SO-101/
 └── tests/
 ```
 
-`src/so101/` 配下の `camera` / `dataset` / `policy` / `ui` は、各パッケージの `__init__.py` に想定する役割だけを記載したプレースホルダです。実装はまだありません。
+`src/so101/` 配下の `dataset` / `policy` / `ui` は、各パッケージの `__init__.py` に想定する役割だけを記載したプレースホルダです。実装はまだありません。
+
+カメラの役割（どれが俯瞰か）は物理的な配置の問題で自動検出できないため、リポジトリ直下の `cameras.json` に記述します。**別のリグではこのファイルを編集してください。**
 
 ## スクリプト一覧
 
@@ -81,8 +84,20 @@ SO-101/
 | `scripts/calibrate.py` | LeRobot 公式キャリブレーション（通信リトライのみ追加） |
 | `scripts/teleoperate.py` | テレオペ本体。通信リトライと P ゲイン調整を追加 |
 | `scripts/teleop.sh` | 検証済み設定でテレオペを起動するランチャー |
+| `scripts/find_cameras.py` | カメラの列挙と、1 台ごとのプレビュー画像保存 |
+| `scripts/bench_camera.py` | カメラのフレームレートと、制御ループへの影響を実測 |
 
 引数なしで実行するとポートを自動検出します。`move_test.py` のみ、安全のためポートの明示指定が必須です。
+
+## テスト
+
+実機を必要としないロジックのテストです。
+
+```bash
+uv run pytest
+```
+
+実機が必要な確認は `scripts/` 配下のツールで行います。
 
 ## 動作確認済み環境
 
@@ -93,6 +108,7 @@ SO-101/
 | LeRobot | 0.4.4 |
 | USB シリアル | WCH CH343（VID:PID = `1A86:55D3`）× 2 |
 | サーボ | Feetech STS3215 × 12、1,000,000 baud |
+| カメラ | UVC カメラ（DirectShow）。1280x720 MJPG で約 20 fps |
 
 Docker は使っていません。Windows の Docker Desktop は USB/IP ブリッジなしに COM ポートを渡せないためです。
 
