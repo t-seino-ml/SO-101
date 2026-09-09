@@ -4,8 +4,13 @@ The arm that moves is the leader; the untouched one is the follower.
 """
 import sys
 import time
-from ports import resolve
-from sts3215 import Bus, JOINT_NAMES, TICKS_PER_DEG, PRESENT_POSITION
+from so101.hardware import (
+    Bus,
+    JOINT_NAMES,
+    PRESENT_POSITION,
+    TICKS_PER_DEG,
+    resolve,
+)
 
 PORTS = resolve(sys.argv[1:])
 GRACE = 8.0

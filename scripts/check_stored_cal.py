@@ -4,20 +4,25 @@ LeRobot's `set_half_turn_homings` calls `reset_calibration()`, which wipes the
 Min/Max_Position_Limit and Homing_Offset held in servo EEPROM. A failed calibration
 therefore leaves an arm *less* calibrated than before. Take a snapshot first.
 
-    python check_stored_cal.py save     # write servo_baseline.json
-    python check_stored_cal.py          # show current values, diffed against it
+    uv run scripts/check_stored_cal.py save     # write servo_baseline.json
+    uv run scripts/check_stored_cal.py          # show current values, diffed against it
 """
 
 import json
 import sys
 from pathlib import Path
 
-from ports import resolve
-from sts3215 import Bus, JOINT_NAMES, MAX_ANGLE_LIMIT, MIN_ANGLE_LIMIT
+from so101.hardware import (
+    Bus,
+    JOINT_NAMES,
+    MAX_ANGLE_LIMIT,
+    MIN_ANGLE_LIMIT,
+    resolve,
+)
 
 HOMING_OFFSET = 31
 ENCODER_MAX = 4095
-BASELINE_FPATH = Path(__file__).with_name("servo_baseline.json")
+BASELINE_FPATH = Path(__file__).resolve().parents[1] / "servo_baseline.json"  # repo root
 
 
 def signed11(raw):
@@ -71,5 +76,5 @@ for port, state in current.items():
         print(f"{sid:>2} {name:<14} {f'{lo}-{hi}':>12} {homing:>7}  {status}")
 
 if not baseline:
-    print(f"\nNo baseline yet. Run 'python check_stored_cal.py save' before "
+    print(f"\nNo baseline yet. Run 'uv run scripts/check_stored_cal.py save' before "
           f"calibrating, so a failed run can be spotted.")

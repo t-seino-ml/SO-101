@@ -1,13 +1,12 @@
 """Ping every servo on each bus and report its present position.
 
-    python scan_servos.py            # auto-detect ports
-    python scan_servos.py COM4
+    uv run scripts/scan_servos.py            # auto-detect ports
+    uv run scripts/scan_servos.py COM4
 """
 
 import sys
 
-from ports import resolve
-from sts3215 import Bus, JOINT_NAMES, PRESENT_POSITION
+from so101.hardware import Bus, JOINT_NAMES, PRESENT_POSITION, resolve
 
 BAUD_RATES = (1_000_000, 500_000, 115_200)
 SCAN_IDS = range(1, 13)

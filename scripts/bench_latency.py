@@ -3,8 +3,8 @@ import statistics
 import sys
 import time
 
-import bus_patch  # noqa: F401
-from ports import resolve
+from so101.hardware import bus_patch  # noqa: F401
+from so101.hardware import resolve
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 

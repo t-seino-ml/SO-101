@@ -1,10 +1,10 @@
 """Drive each SO-101 joint through a small sweep and back, one joint at a time.
 
-Usage: python move_test.py COM4 [--amplitude-deg 25] [--ids 1,2,3,4,5,6]
+Usage: uv run scripts/move_test.py COM4 [--amplitude-deg 25] [--ids 1,2,3,4,5,6]
 """
 import argparse
 import time
-from sts3215 import (
+from so101.hardware import (
     Bus, JOINT_NAMES, TICKS_PER_DEG,
     PRESENT_POSITION, PRESENT_TEMPERATURE,
     MIN_ANGLE_LIMIT, MAX_ANGLE_LIMIT,

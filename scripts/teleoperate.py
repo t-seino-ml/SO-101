@@ -9,15 +9,15 @@ this script raises it to 24, which tracks noticeably tighter on this arm without
 oscillating. Override with SO101_P_COEFFICIENT - "16" restores LeRobot's value, "32"
 is the servo default.
 
-    python teleoperate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower \
+    uv run scripts/teleoperate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower \
         --teleop.type=so101_leader --teleop.port=COM3 --teleop.id=leader --fps=120
 
-    SO101_P_COEFFICIENT=32 python teleoperate.py ...   # snappier still, may oscillate
+    SO101_P_COEFFICIENT=32 uv run scripts/teleoperate.py ...   # snappier still, may oscillate
 """
 
 import os
 
-import bus_patch
+from so101.hardware import bus_patch
 from lerobot.robots.so_follower.so_follower import SOFollower
 
 P_COEFFICIENT = os.environ.get("SO101_P_COEFFICIENT", "24")

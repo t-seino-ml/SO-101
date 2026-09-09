@@ -12,14 +12,14 @@ starting pose works, and the resulting range is centred on 2047 by construction.
 The output is a normal LeRobot calibration file, written to the same path and in the
 same format as `lerobot-calibrate`, plus the same values written to the servos.
 
-    python easy_calibrate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower
-    python easy_calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
+    uv run scripts/easy_calibrate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower
+    uv run scripts/easy_calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
 """
 
 import json
 from pathlib import Path
 
-import bus_patch  # noqa: F401  - installs the serial retry patches
+from so101.hardware import bus_patch  # noqa: F401  - installs the serial retry patches
 import draccus
 from lerobot.motors import MotorCalibration
 from lerobot.motors.feetech import OperatingMode
@@ -34,7 +34,7 @@ from lerobot.utils.utils import enter_pressed, init_logging, move_cursor_up
 FULL_TURN_MOTOR = "wrist_roll"
 MIN_TRAVEL = 100  # ticks; below this a joint was clearly never moved
 CLEAR_EOL = "\x1b[K"  # a redraw that is shorter than the previous line leaves debris
-RECORDING_FPATH = Path(__file__).with_name("last_recording.json")
+RECORDING_FPATH = Path(__file__).resolve().parents[1] / "last_recording.json"  # repo root
 
 
 def record_travel(bus, motor_names):

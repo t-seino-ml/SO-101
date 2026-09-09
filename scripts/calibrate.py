@@ -3,11 +3,11 @@
 See bus_patch.py for what is patched and why. Prefer easy_calibrate.py, which also
 removes the "move it to the middle of its range first" requirement.
 
-    python calibrate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower
-    python calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
+    uv run scripts/calibrate.py --robot.type=so101_follower --robot.port=COM4 --robot.id=follower
+    uv run scripts/calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
 """
 
-import bus_patch
+from so101.hardware import bus_patch
 
 if __name__ == "__main__":
     from lerobot.scripts.lerobot_calibrate import main

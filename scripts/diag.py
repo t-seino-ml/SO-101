@@ -1,10 +1,9 @@
 """Read-only health report for every servo on both SO-101 arms."""
 import sys
-from ports import resolve
-from sts3215 import (
+from so101.hardware import (
     Bus, JOINT_NAMES, TICKS_PER_DEG,
     PRESENT_POSITION, PRESENT_VOLTAGE, PRESENT_TEMPERATURE,
-    TORQUE_ENABLE, MIN_ANGLE_LIMIT, MAX_ANGLE_LIMIT,
+    TORQUE_ENABLE, MIN_ANGLE_LIMIT, MAX_ANGLE_LIMIT, resolve,
 )
 
 for port in resolve(sys.argv[1:]):
