@@ -2,6 +2,10 @@
 
 The arm that moves is the leader; the untouched one is the follower.
 """
+from so101.platform import require_windows
+
+require_windows()
+
 import sys
 import time
 from so101.hardware import (

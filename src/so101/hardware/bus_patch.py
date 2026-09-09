@@ -15,9 +15,22 @@ Import this before running any LeRobot entry point that talks to the servos.
    avoids the problem outright by recording first and centring afterwards.
 """
 
+import os
+
+from lerobot.motors.feetech import feetech
 from lerobot.motors.motors_bus import MotorsBus
 
-NUM_RETRY = 10
+# Each retry waits out a full serial timeout, so this trades robustness against
+# stall length: one dropped packet costs NUM_RETRY x timeout of frozen control.
+# Three is enough to survive the occasional garbled status packet without a stall
+# long enough to feel.
+NUM_RETRY = int(os.environ.get("SO101_SERIAL_RETRIES", "3"))
+
+# LeRobot patches the SDK's setPacketTimeout to add a flat 50 ms margin, so every
+# dropped packet freezes control for ~52 ms - long enough to feel as a hitch while
+# teleoperating. At 1 Mbaud a six-servo sync read replies in about 0.5 ms, so 50 ms
+# is a hundredfold margin. 5 ms still covers servo processing and scheduler jitter.
+PACKET_TIMEOUT_MARGIN_MS = float(os.environ.get("SO101_PACKET_TIMEOUT_MS", "5"))
 ENCODER_MIN, ENCODER_MAX = 0, 4095
 
 _record_ranges = MotorsBus.record_ranges_of_motion
@@ -60,6 +73,16 @@ def _record_ranges_clamped(self, motors=None, display_values=True):
         print()
     return mins, maxes
 
+
+def _set_packet_timeout(self, packet_length):
+    self.packet_start_time = self.getCurrentTime()
+    self.packet_timeout = (self.tx_time_per_byte * (packet_length + 3.0)
+                           + PACKET_TIMEOUT_MARGIN_MS)
+
+
+# Replace the module-level function; FeetechMotorsBus binds it per PortHandler in
+# its constructor, so this has to happen before any bus is created.
+feetech.patch_setPacketTimeout = _set_packet_timeout
 
 MotorsBus.record_ranges_of_motion = _record_ranges_clamped
 MotorsBus._sync_read = _sync_read_retrying

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -22,7 +23,7 @@ import cv2
 IS_WINDOWS = sys.platform == "win32"
 BACKEND = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
 MAX_INDEX = 10
-WARMUP_FRAMES = 5  # the first frames off a UVC camera are often black or stale
+WARMUP_S = 1.5  # auto-exposure settles in about 1.2s on this rig's cameras
 
 
 def device_names():
@@ -58,11 +59,14 @@ class CameraInfo:
         return f"{self.label} - {self.width}x{self.height} @ {self.fps:.0f} fps"
 
 
-def probe(index, warmup=WARMUP_FRAMES):
-    """Open one camera, read a frame, and report what it actually delivers.
+def probe(index, warmup_s=WARMUP_S):
+    """Open one camera, let it settle, then report what it actually delivers.
 
-    Returns (CameraInfo, frame or None). The reported size comes from the frame
-    itself, not from the capture properties, which lie on plenty of UVC devices.
+    Returns (CameraInfo, frame or None). The warmup is time-based, not a frame
+    count: a UVC camera's auto-exposure needs about a second to converge, and a
+    frame grabbed before then is washed out or black regardless of the scene. The
+    reported size comes from the frame itself, not from the capture properties,
+    which lie on plenty of UVC devices.
     """
     names = device_names()
     name = names[index] if index < len(names) else f"OpenCV camera {index}"
@@ -73,7 +77,8 @@ def probe(index, warmup=WARMUP_FRAMES):
         if not capture.isOpened():
             return info, None
         frame = None
-        for _ in range(warmup):
+        deadline = time.perf_counter() + warmup_s
+        while time.perf_counter() < deadline:
             ok, candidate = capture.read()
             if ok and candidate is not None:
                 frame = candidate
@@ -139,7 +144,14 @@ def open_camera(spec, width=None, height=None, fps=None, fourcc=None):
     index = resolve(spec)
     capture = cv2.VideoCapture(index, BACKEND)
     if not capture.isOpened():
-        raise RuntimeError(f"Could not open camera {spec!r} (index {index})")
+        raise RuntimeError(
+            f"Could not open camera {spec!r} (index {index}). "
+            "If another camera is already open, the two are most likely sharing a "
+            "USB 2.0 hub. DirectShow starts the stream at open time and reserves "
+            "isochronous bandwidth for the camera's default uncompressed format, "
+            "which leaves no room for a second camera on the same hub. Moving one "
+            "camera to a port on a different USB controller fixes it."
+        )
     if fourcc:
         capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
     if width:
@@ -148,6 +160,14 @@ def open_camera(spec, width=None, height=None, fps=None, fourcc=None):
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     if fps:
         capture.set(cv2.CAP_PROP_FPS, fps)
+    if fourcc or width or height:
+        # Read once so DirectShow rebuilds the graph on the new format before the
+        # caller opens another camera. Until that happens the camera still holds
+        # the isochronous bandwidth its uncompressed default reserved at open, and
+        # a second camera on the same USB controller cannot start. Note the
+        # requested size has to differ from the default: asking for MJPG at the
+        # same resolution leaves DirectShow on the original uncompressed format.
+        capture.read()
     return capture
 
 

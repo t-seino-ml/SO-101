@@ -1,4 +1,8 @@
 """Measure sync-read round-trip latency on a servo bus (read-only)."""
+from so101.platform import require_windows
+
+require_windows()
+
 import statistics
 import sys
 import time

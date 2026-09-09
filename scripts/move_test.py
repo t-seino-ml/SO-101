@@ -2,6 +2,10 @@
 
 Usage: uv run scripts/move_test.py COM4 [--amplitude-deg 25] [--ids 1,2,3,4,5,6]
 """
+from so101.platform import require_windows
+
+require_windows()
+
 import argparse
 import time
 from so101.hardware import (

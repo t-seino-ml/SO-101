@@ -8,6 +8,10 @@ therefore leaves an arm *less* calibrated than before. Take a snapshot first.
     uv run scripts/check_stored_cal.py          # show current values, diffed against it
 """
 
+from so101.platform import require_windows
+
+require_windows()
+
 import json
 import sys
 from pathlib import Path

@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .discovery import actual_format, open_camera, resolve
+from .discovery import WARMUP_S, actual_format, open_camera, resolve
 
 
 @dataclass
@@ -35,14 +35,16 @@ class CameraStream:
     """Reads one camera in a background thread and publishes the latest frame."""
 
     def __init__(self, spec, width=None, height=None, fps=None, fourcc=None,
-                 name=None):
+                 name=None, warmup_s=WARMUP_S):
         self.spec = spec
         self.width = width
         self.height = height
         self.fps = fps
         self.fourcc = fourcc
+        self.warmup_s = warmup_s
         self.name = name or str(spec)
         self.format = None  # what the camera settled on, filled in by start()
+        self.index = None  # resolved in start(), never from the reader thread
 
         self._capture = None
         self._thread = None
@@ -58,7 +60,10 @@ class CameraStream:
     def start(self):
         if self._thread is not None:
             raise RuntimeError(f"{self.name} is already started")
-        self._capture = open_camera(self.spec, self.width, self.height, self.fps,
+        # Resolve the name here, on the calling thread. Name lookup goes through
+        # DirectShow COM, and two reader threads doing that concurrently deadlocks.
+        self.index = resolve(self.spec)
+        self._capture = open_camera(self.index, self.width, self.height, self.fps,
                                     self.fourcc)
         self.format = actual_format(self._capture)
         self._stop.clear()
@@ -86,7 +91,10 @@ class CameraStream:
     # -- capture -----------------------------------------------------------
 
     def _run(self):
-        index = resolve(self.spec)
+        index = self.index
+        # Publish nothing until auto-exposure has settled, so the first frame a
+        # caller sees is usable rather than washed out.
+        settled_at = time.perf_counter() + self.warmup_s
         while not self._stop.is_set():
             ok, image = self._capture.read()
             if not ok or image is None:
@@ -94,7 +102,10 @@ class CameraStream:
                 # Do not spin on a camera that has gone away.
                 time.sleep(0.01)
                 continue
-            frame = Frame(image=image, timestamp=time.perf_counter(), index=index)
+            now = time.perf_counter()
+            if now < settled_at:
+                continue
+            frame = Frame(image=image, timestamp=now, index=index)
             with self._lock:
                 self._frame = frame
                 self._frames_read += 1
@@ -142,9 +153,11 @@ class CameraSet:
         self.streams = dict(streams)
 
     @classmethod
-    def from_specs(cls, specs, width=None, height=None, fps=None, fourcc=None):
-        """`specs` maps a role ("overhead", "wrist") to a camera name or index."""
-        return cls({role: CameraStream(spec, width, height, fps, fourcc, name=role)
+    def from_specs(cls, specs, width=None, height=None, fps=None, fourcc=None,
+                   warmup_s=WARMUP_S):
+        """`specs` maps a role ("overhead", "side") to a camera name or index."""
+        return cls({role: CameraStream(spec, width, height, fps, fourcc, name=role,
+                                       warmup_s=warmup_s)
                     for role, spec in specs.items()})
 
     def start(self):

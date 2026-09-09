@@ -1,8 +1,15 @@
 {
   "overhead": {
     "name": "icspring",
-    "width": 1280,
-    "height": 720,
+    "width": 800,
+    "height": 600,
+    "fps": 20,
+    "fourcc": "MJPG"
+  },
+  "side": {
+    "name": "EMEET",
+    "width": 800,
+    "height": 600,
     "fps": 20,
     "fourcc": "MJPG"
   }

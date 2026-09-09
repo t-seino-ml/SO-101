@@ -4,6 +4,10 @@
     uv run scripts/scan_servos.py COM4
 """
 
+from so101.platform import require_windows
+
+require_windows()
+
 import sys
 
 from so101.hardware import Bus, JOINT_NAMES, PRESENT_POSITION, resolve

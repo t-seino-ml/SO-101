@@ -1,4 +1,8 @@
 """Read-only health report for every servo on both SO-101 arms."""
+from so101.platform import require_windows
+
+require_windows()
+
 import sys
 from so101.hardware import (
     Bus, JOINT_NAMES, TICKS_PER_DEG,

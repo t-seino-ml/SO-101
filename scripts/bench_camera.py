@@ -8,6 +8,10 @@ is whether capturing frames slows the servo loop down.
     uv run scripts/bench_camera.py --cameras icspring,0
 """
 
+from so101.platform import require_windows
+
+require_windows()
+
 import argparse
 import statistics
 import time

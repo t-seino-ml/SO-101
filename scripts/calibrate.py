@@ -7,6 +7,10 @@ removes the "move it to the middle of its range first" requirement.
     uv run scripts/calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
 """
 
+from so101.platform import require_windows
+
+require_windows()
+
 from so101.hardware import bus_patch
 
 if __name__ == "__main__":

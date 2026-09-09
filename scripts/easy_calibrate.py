@@ -16,6 +16,10 @@ same format as `lerobot-calibrate`, plus the same values written to the servos.
     uv run scripts/easy_calibrate.py --teleop.type=so101_leader  --teleop.port=COM3 --teleop.id=leader
 """
 
+from so101.platform import require_windows
+
+require_windows()
+
 import json
 from pathlib import Path
 
