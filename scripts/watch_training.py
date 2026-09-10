@@ -58,17 +58,33 @@ def falls(key):
 
 
 class Source:
-    """A training run's numbers, however that run happens to write them."""
+    """A training run's numbers, however that run happens to write them.
+
+    A run that was resumed has its history split across the logs of each
+    attempt, so several paths can stand for one run: their rows are merged and
+    sorted, and a step recorded twice keeps the later reading.
+    """
 
     def __init__(self, path, kind):
-        self.path = Path(path)
+        paths = [Path(p) for p in (path if isinstance(path, (list, tuple))
+                                   else [path])]
+        self.paths = paths
+        self.path = paths[-1]
         self.kind = kind
         self.panels = POLICY_PANELS if kind == "policy" else DETECTOR_PANELS
         self.x_key = "step" if kind == "policy" else "epoch"
         self.total = None
 
     def read(self):
-        return self._read_log() if self.kind == "policy" else self._read_csv()
+        if self.kind != "policy":
+            return self._read_csv()
+        merged, total = {}, None
+        for path in self.paths:
+            for row in self._read_log(path):
+                merged[row["step"]] = row
+            total = max(total or 0, self.total or 0) or None
+        self.total = total
+        return [merged[step] for step in sorted(merged)]
 
     def _read_csv(self):
         """results.csv, tolerating a row half-written as we read it."""
@@ -86,7 +102,7 @@ class Source:
                 continue      # a partial final line; complete on the next pass
         return [row for row in rows if "epoch" in row]
 
-    def _read_log(self):
+    def _read_log(self, path=None):
         """LeRobot's step lines, placed on a true step axis.
 
         Neither number in the log is usable on its own. The step count in the
@@ -95,12 +111,12 @@ class Source:
         a resumed run would either climb in jumps or restart from the origin.
 
         Together they pin it down: the bar is exact and its spacing gives the
-        logging interval, and the rounded text gives the offset the bar is
-        missing. The offset is taken as a median over every line, so one
-        badly-rounded value cannot shift the axis.
+        logging interval, while the rounded text supplies the offset the bar
+        has lost.
         """
         try:
-            text = self.path.read_text(encoding="utf-8", errors="replace")
+            text = (path or self.path).read_text(encoding="utf-8",
+                                                 errors="replace")
         except OSError:
             return []
 
@@ -132,7 +148,13 @@ class Source:
 
     @staticmethod
     def _step_axis(bars, logged):
-        """Absolute step for each logged line."""
+        """Absolute step for each logged line.
+
+        The shift between the two is one unknown constant. LeRobot rounds the
+        number it prints to the nearest thousand, so every line says the shift
+        lies within 500 of its own estimate - and the true shift is the one
+        candidate that no line contradicts.
+        """
         usable = [(bar, value) for bar, value in zip(bars, logged)
                   if bar is not None]
         if not usable:
@@ -140,9 +162,17 @@ class Source:
 
         gaps = [b - a for (a, _), (b, _) in zip(usable, usable[1:]) if b > a]
         interval = min(gaps) if gaps else 1
-        shifts = sorted(value - bar for bar, value in usable)
-        shift = shifts[len(shifts) // 2]
-        shift = round(shift / interval) * interval
+        candidates = {round((value - bar) / interval) * interval
+                      for bar, value in usable}
+        tolerance = 500 if max(logged) >= 1000 else 0.5
+
+        def disagreement(shift):
+            misses = sum(abs(bar + shift - value) > tolerance
+                         for bar, value in usable)
+            drift = sum(abs(bar + shift - value) for bar, value in usable)
+            return misses, drift
+
+        shift = min(candidates, key=disagreement)
         return [bar + shift if bar is not None else value
                 for bar, value in zip(bars, logged)]
 
@@ -150,10 +180,13 @@ class Source:
 def find_source(explicit=None):
     """The run that was written to most recently, unless one was named."""
     if explicit:
-        path = Path(explicit)
-        if not path.is_file():
-            raise SystemExit(f"{path} not found")
-        return Source(path, "policy" if path.suffix == ".log" else "detector")
+        paths = [Path(p) for p in (explicit if isinstance(explicit, (list, tuple))
+                                   else [explicit])]
+        for path in paths:
+            if not path.is_file():
+                raise SystemExit(f"{path} not found")
+        kind = "policy" if paths[0].suffix == ".log" else "detector"
+        return Source(paths if kind == "policy" else paths[0], kind)
 
     candidates = [(p, "detector") for p in Path("runs").rglob("results.csv")]
     for path in Path("runs").rglob("*.log"):
@@ -236,9 +269,9 @@ def render_plot(source, rows, axes):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default=None,
-                        help="results.csv or a LeRobot training log "
-                             "(default: whichever run is newest)")
+    parser.add_argument("--source", nargs="+", default=None,
+                        help="results.csv, or one or more LeRobot training logs "
+                             "of the same run (default: whichever is newest)")
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--terminal", action="store_true",
                         help="print instead of opening a window")
@@ -247,7 +280,8 @@ def main():
     args = parser.parse_args()
 
     source = find_source(args.source)
-    print(f"  watching {source.path}  ({source.kind})")
+    print(f"  watching {', '.join(str(p) for p in source.paths)}  "
+          f"({source.kind})")
 
     if args.terminal:
         seen = 0
