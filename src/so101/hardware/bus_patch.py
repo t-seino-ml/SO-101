@@ -16,6 +16,7 @@ Import this before running any LeRobot entry point that talks to the servos.
 """
 
 import os
+import time
 
 from lerobot.motors.feetech import feetech
 from lerobot.motors.motors_bus import MotorsBus
@@ -33,6 +34,7 @@ NUM_RETRY = int(os.environ.get("SO101_SERIAL_RETRIES", "3"))
 PACKET_TIMEOUT_MARGIN_MS = float(os.environ.get("SO101_PACKET_TIMEOUT_MS", "5"))
 ENCODER_MIN, ENCODER_MAX = 0, 4095
 
+_connect = MotorsBus.connect
 _ping = MotorsBus.ping
 _record_ranges = MotorsBus.record_ranges_of_motion
 _sync_read = MotorsBus._sync_read
@@ -53,6 +55,38 @@ def _read_retrying(self, addr, length, motor_id, *, num_retry=0, **kwargs):
 def _write_retrying(self, addr, length, motor_id, value, *, num_retry=0, **kwargs):
     return _write(self, addr, length, motor_id, value,
                   num_retry=max(num_retry, NUM_RETRY), **kwargs)
+
+
+def _clear_latched_faults(bus):
+    """Reset servos that have tripped their protection, before the roll call.
+
+    A Feetech servo that has latched answers with the fault bit set and freezes its
+    load register, and `_assert_motors_exist` reads that as "motor missing" - so
+    connect fails naming a servo that is present and healthy. Toggling torque
+    clears the latch once the joint is no longer straining, which it is not by the
+    time anything reconnects.
+    """
+    from .sts3215 import GOAL_POSITION, PRESENT_POSITION, TORQUE_ENABLE, Bus
+
+    try:
+        with Bus(bus.port) as raw:
+            for motor in bus.motors.values():
+                position = raw.read(motor.id, PRESENT_POSITION, 2)
+                if position is None:
+                    continue
+                # Park the goal first, so clearing cannot make a joint lunge.
+                raw.write(motor.id, GOAL_POSITION, position, size=2)
+                for value in (0, 1, 0):
+                    raw.write(motor.id, TORQUE_ENABLE, value)
+                    time.sleep(0.05)
+    except Exception:  # noqa: BLE001 - best effort; connect will report the truth
+        pass
+
+
+def _connect_clearing_faults(self, handshake=True):
+    if handshake:
+        _clear_latched_faults(self)
+    return _connect(self, handshake)
 
 
 def _ping_retrying(self, motor, num_retry=0, raise_on_error=False):
@@ -97,6 +131,7 @@ def _set_packet_timeout(self, packet_length):
 # its constructor, so this has to happen before any bus is created.
 feetech.patch_setPacketTimeout = _set_packet_timeout
 
+MotorsBus.connect = _connect_clearing_faults
 MotorsBus.ping = _ping_retrying
 MotorsBus.record_ranges_of_motion = _record_ranges_clamped
 MotorsBus._sync_read = _sync_read_retrying

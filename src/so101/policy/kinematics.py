@@ -27,6 +27,12 @@ JOINT_ORDER = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex",
                "wrist_roll")
 ACTIVE_SLICE = slice(1, 6)
 
+# Straight down in the base frame. Solving for position alone leaves the wrist at
+# whatever angle the solver happens to land on - measured at 21 degrees off
+# vertical in one case - and a gripper that is not pointing down cannot close on a
+# block lying on the table however well its position matches.
+DOWN = np.array([0.0, 0.0, -1.0])
+
 
 class ArmKinematics:
     """FK and IK for the five arm joints. The gripper is not part of the chain."""
@@ -87,8 +93,13 @@ class ArmKinematics:
         return self.chain.forward_kinematics(
             self._to_chain(joints_deg, clamp=False))[:3, 3]
 
-    def inverse(self, position, seed_deg=None, tolerance_mm=2.0):
+    def inverse(self, position, seed_deg=None, tolerance_mm=2.0, orientation=DOWN):
         """Joint angles that put the gripper frame at `position`.
+
+        `orientation` constrains the tool's approach axis - by default straight
+        down, which is what grasping a block off a table needs. Pass None to solve
+        for position alone, which is faster but leaves the wrist wherever the
+        solver lands.
 
         `seed_deg` should be the arm's current pose: IK is a local search, so
         seeding it from where the arm already is keeps the solution near the
@@ -98,16 +109,25 @@ class ArmKinematics:
         rather than handing back a pose that quietly misses.
         """
         seed = self._to_chain(seed_deg) if seed_deg is not None else None
+        kwargs = {} if orientation is None else {
+            "target_orientation": np.asarray(orientation, float),
+            "orientation_mode": "Z",
+        }
         solution = self.chain.inverse_kinematics(np.asarray(position, float),
-                                                 initial_position=seed)
+                                                 initial_position=seed, **kwargs)
         reached = self.chain.forward_kinematics(solution)[:3, 3]
         error_mm = 1000 * float(np.linalg.norm(reached - np.asarray(position, float)))
         if error_mm > tolerance_mm:
             return None
         return self._from_chain(solution)
 
-    def reachable(self, position, seed_deg=None, tolerance_mm=2.0):
-        return self.inverse(position, seed_deg, tolerance_mm) is not None
+    def reachable(self, position, seed_deg=None, tolerance_mm=2.0, orientation=DOWN):
+        return self.inverse(position, seed_deg, tolerance_mm, orientation) is not None
+
+    def tool_axis(self, joints_deg):
+        """Which way the gripper points, as a unit vector in the base frame."""
+        pose = self.chain.forward_kinematics(self._to_chain(joints_deg, clamp=False))
+        return pose[:3, 2]
 
     # -- limits -----------------------------------------------------------
 

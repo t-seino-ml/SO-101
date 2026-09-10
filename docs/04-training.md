@@ -1,36 +1,75 @@
-# フェーズ 4: モデル構築・推論（未着手）
+# フェーズ 4: ポリシー学習・実行
 
-> このドキュメントは**計画**です。実装・検証はまだ行っていません。
+`data/demos` の実演から ACT ポリシーを学習し、フォロワー機で自律実行します。
 
-## 目的
+## 学習
 
-記録したデータセットからポリシーを学習し、フォロワー機で自律動作させます。
+```powershell
+uv run scripts/train_policy.py --steps 20000    # まず短縮版で効果を確認
+uv run scripts/train_policy.py                  # 本番 100k ステップ
+uv run scripts/train_policy.py --cameras wrist,side
+```
 
-## LeRobot 側の既存機能
+入力は `observation.images.wrist` + `observation.state`、出力は 6 関節の目標角度。
+色も座標も渡していません。
 
-| コマンド | 用途 |
+### なぜ `lerobot-train` を直接呼ばないか
+
+LeRobot はデータセット内の全特徴からポリシーの入力を決めるため、両方の
+カメラを記録したデータセットでは両方が入力になります。これを絞るには
+`input_features` をポリシー構築**前**に設定する必要があり（`make_policy` は
+空のときしか埋めません）、CLI からは届きません。`scripts/train_policy.py` は
+`draccus.parse` で設定を作ってから `input_features` を差し替えています。
+
+### Windows での注意
+
+LeRobot は最新チェックポイントをシンボリックリンクで指しますが、Windows は
+管理者権限なしにこれを作れません。保存**後**に失敗するのでチェックポイント
+自体は無事ですが、例外で学習が止まります。`train_policy.py` は
+`lerobot_train.update_last_checkpoint` を差し替え、代わりに `last.txt` に
+名前を書きます（`train_utils` 側を差し替えても効きません。関数が直接
+import されているためです）。
+
+### 実測
+
+RTX 4060 Laptop で約 3.0 step/s（batch 8、chunk 100）。
+
+| ステップ数 | 所要時間の目安 |
 |---|---|
-| `lerobot-train` | ポリシーの学習 |
-| `lerobot-eval` | 学習済みポリシーの評価 |
+| 20,000 | 約 1.8 時間 |
+| 100,000 | 約 9 時間 |
 
-## 決めること
+学習曲線は `uv run scripts/watch_training.py` でリアルタイムに見られます。
 
-- **ポリシーの種類** — ACT、Diffusion Policy、SmolVLA など。SO-101 + 単一タスクなら ACT が定番です
-- **学習環境** — この PC の GPU で回すか、クラウドを使うか。PyTorch 2.10 が入っています
-- **観測の構成** — 関節角度のみか、カメラ画像を含めるか
+## 実行
+
+```powershell
+uv run scripts/run_policy.py
+uv run scripts/run_policy.py --seconds 20 --max-step 3
+uv run scripts/run_policy.py --checkpoint runs/policy/grasp/checkpoints/020000
+```
+
+`last.txt` から最新チェックポイントを読み、ポリシーが宣言しているカメラだけを
+開き、フォロワー機を 30 Hz で駆動します。
 
 ## 安全面（重要）
 
-**自律動作はテレオペと違い、人間が常時ハンドルを握っていません。** フェーズ 1 で使った安全機構をそのまま適用する必要があります。
+**自律動作ではリーダー機を人間が握っていません。** 以下を `run_policy.py` に
+組み込んであります。
 
-- `max_relative_target` による 1 ステップあたりの移動量制限
-- `move_test.py` と同等の負荷・温度による自動中断
-- 物理的な非常停止手段（電源スイッチを手の届く位置に）
+- 1 制御ステップあたりの関節移動量を `--max-step`（既定 4 度）に制限。
+  予測が外れてもアームが飛びません
+- 全関節の負荷・温度を毎ステップ監視し、閾値超過で中断
+- Ctrl-C・時間切れ・過負荷のいずれでも、開始時の姿勢に戻してからトルクを抜く
 
-推論ループも `sync_read` を使うため、`bus_patch` の適用が必要です。
+物理的な非常停止手段（電源スイッチを手の届く位置に）は変わらず必要です。
 
-## 確認したい項目
+## この先
 
-- [ ] GPU で学習が回るか、VRAM は足りるか
-- [ ] 学習にかかる時間
-- [ ] 推論のレイテンシが制御周期に間に合うか（`bench_latency.py` と同じ方法で実測）
+学習済みポリシーは「目の前のブロックをつかむ」しかしません。フェーズ 5 で
+統合します。
+
+1. UI で色を選ぶ
+2. 側面カメラの検出器がその色のブロックを見つける（`docs/07-vision.md`）
+3. キャリブレーション済みのホモグラフィでアーム座標に変換し、粗く移動する
+4. ここからポリシーに引き渡す

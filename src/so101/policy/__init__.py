@@ -1,11 +1,21 @@
-"""Policy training and on-robot inference. Phase 4 - not implemented yet.
+"""Perception-to-motion for the block task.
 
-Intended scope:
+- `kinematics`   forward and inverse kinematics via ikpy and the SO-101 URDF
+- `table_frame`  homography from camera pixels to the arm's own coordinates
+- `auto_calibrate`  fits that homography by watching the arm carry a block
+- `detector`     the trained block detector, with this rig's inference settings
+- `pick_place`   scripted pick-and-place, which will also generate the episodes
+                 a policy is later trained on
 
-- train a policy on a recorded dataset (`lerobot-train`)
-- run inference on the follower arm with the same safety limits the teleop path
-  uses: `max_relative_target`, load and temperature aborts
-- evaluate and compare checkpoints (`lerobot-eval`)
-
-See docs/04-training.md.
+The split is deliberate: the detector says where a block is, the homography turns
+that into a reachable position, and kinematics gets the arm there. Nothing has to
+learn perception and control jointly, which is what makes a small dataset enough.
 """
+
+from .detector import BlockDetector, Detection
+from .pick_place import PickPlace, PickResult
+from .kinematics import ArmKinematics
+from .table_frame import TableFrame
+
+__all__ = ["ArmKinematics", "BlockDetector", "Detection", "PickPlace",
+           "PickResult", "TableFrame"]
