@@ -38,7 +38,7 @@ from so101.hardware import resolve as resolve_port  # noqa: E402
 from so101.hardware import tuning  # noqa: E402
 from so101.policy import ArmKinematics, BlockDetector, TableFrame  # noqa: E402
 
-DEFAULT_WEIGHTS = Path("runs/detect/blocks/weights/best.pt")
+
 OFFSET_PATH = Path("data/grasp_offset.json")
 TELEOP_HZ = 60
 
@@ -85,7 +85,8 @@ def show_stored():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--weights", type=Path, default=None,
+                        help="default: the newest trained detector under runs/")
     parser.add_argument("--camera", default="side")
     parser.add_argument("--follower-port", default="COM4")
     parser.add_argument("--leader-port", default="COM3")
@@ -96,8 +97,7 @@ def main():
 
     if args.show:
         return show_stored()
-    if not args.weights.is_file():
-        raise SystemExit(f"{args.weights} not found. Train the detector first.")
+
 
     from lerobot.robots import make_robot_from_config
     from lerobot.robots.so_follower import SO101FollowerConfig

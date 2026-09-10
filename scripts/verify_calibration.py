@@ -35,7 +35,7 @@ from so101.hardware import resolve as resolve_port  # noqa: E402
 from so101.hardware import tuning  # noqa: E402
 from so101.policy import ArmKinematics, BlockDetector, TableFrame  # noqa: E402
 
-DEFAULT_WEIGHTS = Path("runs/detect/blocks/weights/best.pt")
+
 HOVER = 0.012          # metres above the block's reported top
 # Pointing the gripper down costs reach: at this table height only 19 of 35
 # workspace points solve at 8 cm, against 33 at 3 cm. See so101.policy.pick_place.
@@ -126,7 +126,8 @@ def move_to(robot, arm, position, settle=True):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--weights", type=Path, default=None,
+                        help="default: the newest trained detector under runs/")
     parser.add_argument("--camera", default="side")
     parser.add_argument("--follower-port", default="COM4")
     parser.add_argument("--colour", default=None, help="only check this colour")
@@ -136,8 +137,7 @@ def main():
                         help="stop after this many blocks")
     args = parser.parse_args()
 
-    if not args.weights.is_file():
-        raise SystemExit(f"{args.weights} not found. Train the detector first.")
+
 
     from lerobot.robots import make_robot_from_config
     from lerobot.robots.so_follower import SO101FollowerConfig

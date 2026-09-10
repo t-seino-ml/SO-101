@@ -12,10 +12,11 @@ that into a reachable position, and kinematics gets the arm there. Nothing has t
 learn perception and control jointly, which is what makes a small dataset enough.
 """
 
-from .detector import BlockDetector, Detection
+from .detector import BlockDetector, find_weights, Detection
 from .pick_place import PickPlace, PickResult
 from .kinematics import ArmKinematics
 from .table_frame import TableFrame
 
-__all__ = ["ArmKinematics", "BlockDetector", "Detection", "PickPlace",
+__all__ = ["ArmKinematics", "BlockDetector",
+    "find_weights", "Detection", "PickPlace",
            "PickResult", "TableFrame"]

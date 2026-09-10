@@ -22,12 +22,13 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from so101.dataset.scenes import CLASS_NAMES  # noqa: E402
+from so101.policy import find_weights  # noqa: E402
 
 BOX_COLOURS = {
     "red": (60, 60, 220), "orange": (60, 150, 240), "yellow": (60, 220, 240),
     "green": (80, 200, 80), "blue": (220, 120, 60), "purple": (200, 80, 140),
 }
-DEFAULT_WEIGHTS = Path("runs/detect/blocks/weights/best.pt")
+
 
 
 def draw(frame, result, conf_threshold):
@@ -110,7 +111,8 @@ def run_live(model, conf, seconds, save, out_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--weights", type=Path, default=None,
+                        help="default: the newest trained detector under runs/")
     parser.add_argument("--conf", type=float, default=0.4)
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument("--images", default=None,
@@ -120,9 +122,7 @@ def main():
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    if not args.weights.is_file():
-        raise SystemExit(f"{args.weights} not found. "
-                         "Train first: uv run scripts/train_detector.py")
+    weights = find_weights(args.weights)
 
     import torch
     from ultralytics import YOLO
@@ -130,9 +130,9 @@ def main():
     device = args.device
     if device is None:
         device = 0 if torch.cuda.is_available() else "cpu"
-    model = YOLO(str(args.weights))
+    model = YOLO(str(weights))
     model.to(device if device == "cpu" else f"cuda:{device}")
-    print(f"  {args.weights} on {device}, confidence >= {args.conf}\n")
+    print(f"  {weights} on {device}, confidence >= {args.conf}\n")
 
     # One warm-up: the first inference pays for CUDA context and graph setup.
     model(np.zeros((600, 800, 3), np.uint8), verbose=False)

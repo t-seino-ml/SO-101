@@ -39,7 +39,7 @@ from so101.hardware import tuning  # noqa: E402
 from so101.policy import ArmKinematics, BlockDetector, TableFrame  # noqa: E402
 from so101.policy.auto_calibrate import AutoCalibrator, grid_positions  # noqa: E402
 
-DEFAULT_WEIGHTS = Path("runs/detect/blocks/weights/best.pt")
+
 # Folded back over the base, clear of the table and of the camera's view of it.
 PARK_JOINTS = {"shoulder_pan": 0.0, "shoulder_lift": -95.0, "elbow_flex": 90.0,
                "wrist_flex": 40.0, "wrist_roll": 0.0}
@@ -162,7 +162,8 @@ def release(robot):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument("--weights", type=Path, default=None,
+                        help="default: the newest trained detector under runs/")
     parser.add_argument("--camera", default="side")
     parser.add_argument("--follower-port", default="COM4")
     parser.add_argument("--leader-port", default="COM3")
@@ -180,8 +181,7 @@ def main():
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
-    if not args.weights.is_file():
-        raise SystemExit(f"{args.weights} not found. Train the detector first.")
+
 
     def parse_range(parts):
         """Accept "0.2,0.4" or "0.2 0.4", with or without a leading minus."""

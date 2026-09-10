@@ -31,6 +31,30 @@ NMS_IOU = 0.45
 AGNOSTIC_NMS = True
 
 
+def find_weights(explicit=None):
+    """Where the detector's weights actually are.
+
+    Ultralytics decides the run directory itself, and where it puts "detect"
+    in the path depends on its own settings - so the trained weights do not
+    reliably land where the training script said they would. Rather than
+    hard-code one guess, take the newest best.pt under runs/.
+    """
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.is_file():
+            raise FileNotFoundError(f"{path} not found")
+        return path
+    if DEFAULT_WEIGHTS.is_file():
+        return DEFAULT_WEIGHTS
+    found = sorted(Path("runs").rglob("weights/best.pt"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if not found:
+        raise FileNotFoundError(
+            "No trained detector under runs/. "
+            "Train one: uv run scripts/train_detector.py")
+    return found[0]
+
+
 @dataclass
 class Detection:
     """One block, in pixels and - when a table frame is supplied - in metres."""
@@ -68,12 +92,9 @@ class Detection:
 class BlockDetector:
     """The trained detector, with this rig's inference settings."""
 
-    def __init__(self, weights=DEFAULT_WEIGHTS, device=None, table_frame=None,
+    def __init__(self, weights=None, device=None, table_frame=None,
                  confidence=CONFIDENCE, nms_iou=NMS_IOU, agnostic=AGNOSTIC_NMS):
-        weights = Path(weights)
-        if not weights.is_file():
-            raise FileNotFoundError(
-                f"{weights} not found. Train first: uv run scripts/train_detector.py")
+        weights = find_weights(weights)
         import torch
         from ultralytics import YOLO
 
