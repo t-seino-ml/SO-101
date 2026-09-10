@@ -42,6 +42,8 @@ POLICY_PANELS = (
 # INFO ... step:6K smpl:48K ep:94 epch:3.15 loss:0.291 grdn:22.207 lr:1.0e-05
 POLICY_LINE = re.compile(r"\bstep:(\S+)\s+.*?\bloss:([0-9.eE+-]+)")
 POLICY_FIELD = re.compile(r"\b(loss|grdn|lr|epch|updt_s|data_s):([0-9.eE+-]+)")
+# tqdm's own counter, which is exact but restarts at zero on a resumed run.
+PROGRESS_LINE = re.compile(r"\b(\d+)/(\d+) \[")
 
 
 def big_number(text):
@@ -85,38 +87,64 @@ class Source:
         return [row for row in rows if "epoch" in row]
 
     def _read_log(self):
-        """LeRobot's step lines.
+        """LeRobot's step lines, placed on a true step axis.
 
-        The step count in them is rounded once it passes a thousand - 6K, not
-        6000 - which would make the x axis climb in visible jumps. The lines are
-        printed at a fixed interval, though, so the first one gives that interval
-        and the rest follow from their position. The rounded value is kept as a
-        check: if it disagrees by more than one interval, trust the log.
+        Neither number in the log is usable on its own. The step count in the
+        text is rounded past a thousand - 20K, not 20200 - and the progress bar
+        beside it counts from zero even when the run resumed at step 20,000, so
+        a resumed run would either climb in jumps or restart from the origin.
+
+        Together they pin it down: the bar is exact and its spacing gives the
+        logging interval, and the rounded text gives the offset the bar is
+        missing. The offset is taken as a median over every line, so one
+        badly-rounded value cannot shift the axis.
         """
         try:
             text = self.path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return []
 
-        rows = []
-        interval = None
-        for line in text.replace("\r", "\n").splitlines():
+        rows, bars, logged = [], [], []
+        bar = None
+        totals = None
+        for line in text.replace(chr(13), chr(10)).splitlines():
+            progress = PROGRESS_LINE.search(line)
+            if progress:
+                bar = int(progress.group(1))
+                totals = int(progress.group(2))
             match = POLICY_LINE.search(line)
             if not match:
                 continue
-            row = {key: float(value) for key, value in POLICY_FIELD.findall(line)}
-            logged = big_number(match.group(1))
-            if interval is None:
-                interval = logged
-            counted = interval * (len(rows) + 1)
-            row["step"] = counted if abs(counted - logged) <= interval else logged
-            rows.append(row)
+            rows.append({key: float(value)
+                         for key, value in POLICY_FIELD.findall(line)})
+            bars.append(bar)
+            logged.append(big_number(match.group(1)))
 
-        # The tqdm bar in the same log carries the total, which the step lines
-        # do not, and it is there from the first step rather than the first log.
-        totals = re.findall(r"/(\d+) \[", text)
-        self.total = int(totals[-1]) if totals else None
+        if not rows:
+            return []
+
+        steps = self._step_axis(bars, logged)
+        for row, step in zip(rows, steps):
+            row["step"] = step
+        offset = steps[-1] - (bars[-1] if bars[-1] is not None else steps[-1])
+        self.total = (totals + offset) if totals is not None else None
         return rows
+
+    @staticmethod
+    def _step_axis(bars, logged):
+        """Absolute step for each logged line."""
+        usable = [(bar, value) for bar, value in zip(bars, logged)
+                  if bar is not None]
+        if not usable:
+            return logged
+
+        gaps = [b - a for (a, _), (b, _) in zip(usable, usable[1:]) if b > a]
+        interval = min(gaps) if gaps else 1
+        shifts = sorted(value - bar for bar, value in usable)
+        shift = shifts[len(shifts) // 2]
+        shift = round(shift / interval) * interval
+        return [bar + shift if bar is not None else value
+                for bar, value in zip(bars, logged)]
 
 
 def find_source(explicit=None):
