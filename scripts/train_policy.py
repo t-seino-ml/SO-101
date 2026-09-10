@@ -16,6 +16,7 @@ the side camera would tie the policy to that camera's placement and undo this.
 
 import argparse
 import pathlib
+import sys
 from pathlib import Path
 
 DEFAULT_ROOT = Path("data/demos")
@@ -36,6 +37,8 @@ def main():
                         help="how many future actions ACT predicts at once")
     parser.add_argument("--save-every", type=int, default=10_000)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="continue the run already in --out, optimizer and all")
     args = parser.parse_args()
 
     if not (args.root / "meta" / "info.json").is_file():
@@ -80,12 +83,25 @@ def main():
     if dropped:
         print(f"  not shown to the policy: {', '.join(dropped)}")
 
-    argv = [
+    resume = []
+    if args.resume:
+        # Resuming needs the train config the run saved beside its weights, and
+        # LeRobot picks the checkpoint up from that path rather than a step
+        # number. The optimizer state travels with it, so this is a genuine
+        # continuation and not a fresh run warm-started from the weights.
+        pointer = args.out / "checkpoints" / "last.txt"
+        if not pointer.is_file():
+            raise SystemExit(f"Nothing to resume in {args.out}: no checkpoints/last.txt")
+        last = args.out / "checkpoints" / pointer.read_text(encoding="utf-8").strip()
+        config_path = last / "pretrained_model" / "train_config.json"
+        if not config_path.is_file():
+            raise SystemExit(f"{config_path} not found")
+        print(f"  resuming from {last.name}")
+        resume = ["--resume=true", f"--config_path={config_path}"]
+
+    argv = resume + [
         f"--dataset.repo_id={args.repo_id}",
         f"--dataset.root={args.root}",
-        "--policy.type=act",
-        f"--policy.chunk_size={args.chunk_size}",
-        f"--policy.n_action_steps={args.chunk_size}",
         f"--policy.device={device}",
         "--policy.push_to_hub=false",
         f"--output_dir={args.out}",
@@ -94,6 +110,10 @@ def main():
         f"--save_freq={args.save_every}",
         "--wandb.enable=false",
     ]
+    if not args.resume:
+        argv[1:1] = ["--policy.type=act",
+                     f"--policy.chunk_size={args.chunk_size}",
+                     f"--policy.n_action_steps={args.chunk_size}"]
     print("  lerobot-train " + " ".join(argv))
     print()
 
@@ -112,6 +132,11 @@ def main():
         pointer.write_text(pathlib.Path(checkpoint_dir).name, encoding="utf-8")
 
     lerobot_train.update_last_checkpoint = _record_last_checkpoint
+
+    # LeRobot reads a few arguments straight out of sys.argv rather than from
+    # the list handed to draccus - --config_path, which resume needs, is one of
+    # them - so the process has to look as though it were invoked with them.
+    sys.argv = [sys.argv[0]] + argv
 
     config = draccus.parse(TrainPipelineConfig, args=argv)
     config.policy.input_features = inputs
