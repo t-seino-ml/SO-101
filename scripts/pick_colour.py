@@ -46,7 +46,7 @@ from so101.policy import (  # noqa: E402
 
 HOVER_M = 0.06           # how far above the grasp to arrive first
 STAGES_M = (0.06, 0.025)  # and the heights to line the block up at, in turn
-JOG_M = 0.025            # how far to step when measuring the pixel scale
+JOG_M = 0.012            # how far to step when measuring the pixel scale
 SERVO_ROUNDS = 8
 SERVO_GAIN = 0.7         # damped, so a noisy detection cannot overshoot
 SERVO_TOLERANCE_PX = 18
@@ -57,8 +57,9 @@ SETTLE_TOLERANCE_M = 0.002
 MIN_SCALE_PX_PER_MM = 0.5
 MAX_SCALE_PX_PER_MM = 40.0
 MAX_SCALE_SKEW = 4.0     # how lopsided the two measured directions may be
-TRACK_PX = 260           # how far the same block may jump between looks
+TRACK_PX = 320           # how far the same block may jump between looks
 GRIP_DEG = 8.0           # narrower than a block, so the block stops the jaws
+FREEZE = ("wrist_roll", "wrist_flex")   # held still while lining a block up
 HOLDING_DEG = 4.0        # jaws this far wider than their free close are holding
 MIN_CONFIDENCE = 0.5
 SETTLE_S = 1.0
@@ -106,8 +107,14 @@ def tip_of(arm, robot):
 
 
 def move_to(robot, arm, approach, pose, position, seconds=1.2,
-            tolerance_mm=1.0):
+            tolerance_mm=1.0, frozen=FREEZE):
     """Shift the arm to `position`, keeping the posture it is already in.
+
+    The wrist is held still throughout. Left free, a twenty-millimetre step
+    sideways can swing it by sixty degrees - the solver is entitled to answer
+    two nearby targets with two quite different postures - and the camera
+    swings with it, so the scale measured a moment ago describes a view that no
+    longer exists. Holding the wrist costs nothing: every step still solves.
 
     The tolerance matters more than it looks. Inverse kinematics stops as soon
     as it is within it, so a loose one lets a 12 mm step land 5 mm short and in
@@ -123,7 +130,8 @@ def move_to(robot, arm, approach, pose, position, seconds=1.2,
     aim = goal.copy()
     moved = None
     for round_number in range(SETTLE_ROUNDS):
-        candidate = approach.refine(pose, aim, tolerance_mm=tolerance_mm)
+        candidate = approach.refine(pose, aim, tolerance_mm=tolerance_mm,
+                                    frozen=frozen)
         if candidate is None:
             return moved
         moved = candidate
@@ -244,6 +252,12 @@ def servo(robot, arm, approach, detector, wrist, colour, pose, where, scale,
     # than it started, the direction is flipped and stays flipped.
     direction = 1.0
     previous = None
+    # Where it was at its best, so a run that starts drifting can be undone.
+    # The error usually falls for two or three rounds and then, if the scale is
+    # a little off, begins to climb - and every round after that is worse than
+    # the one before. Keeping the best and going back to it turns a diverging
+    # attempt into a merely imperfect one.
+    best, best_at, worse = np.inf, None, 0
     for round_number in range(1, args.rounds + 1):
         # A detector that misses one frame is not a lost block; it is one
         # frame. Ask again before giving up.
@@ -262,6 +276,14 @@ def servo(robot, arm, approach, detector, wrist, colour, pose, where, scale,
         error_mm = np.linalg.solve(scale, where - seen.pixel)
         print(f"      {round_number}: off by {distance:.0f} px "
               f"({error_mm[0]:+.0f}, {error_mm[1]:+.0f} mm)")
+        if distance < best:
+            best, best_at, worse = distance, tip_of(arm, robot), 0
+        elif distance > best + 5:
+            worse += 1
+            if worse >= 2:
+                print(f"      drifting; going back to the best, {best:.0f} px")
+                move_to(robot, arm, approach, pose, best_at)
+                return np.array([best, 0.0])
         if distance <= args.tolerance:
             return error_px
         if previous is not None and distance > previous + 5 and direction > 0:
@@ -332,6 +354,7 @@ def pick_one(robot, arm, approach, detector, cameras, side, wrist, table,
     # not survive the descent. Each stage is nearer the height the target was
     # measured at, and the correction it needs is smaller than the last.
     above = joints_of(robot)
+    scale = None
     # What closing on nothing looks like, measured up here where nothing can be
     # between the jaws. Down at grasping height the jaws are among the other
     # blocks, and one of those can stop them just as well as the target - which
@@ -360,18 +383,24 @@ def pick_one(robot, arm, approach, detector, cameras, side, wrist, table,
                 print(f"  {hurt} on the way down")
                 return "strained"
 
-        print(f"  measuring the scale at {1000*height:.0f} mm")
-        # Nearer the table a millimetre is worth more pixels, so the same step
-        # would fling the block past where it can still be recognised as the
-        # same one. Shrink it with the height.
-        jog = max(0.010, args.jog * height / args.hover)
-        scale, _, problem = measure_scale(robot, arm, approach, detector, wrist,
-                                          colour, above, where, jog)
-        if problem:
-            print(f"  {problem}")
-            return "no scale"
-        print(f"      {np.linalg.norm(scale[:, 0]):.2f} and "
-              f"{np.linalg.norm(scale[:, 1]):.2f} px/mm")
+        if scale is None:
+            print(f"  measuring the scale at {1000*height:.0f} mm")
+            scale, _, problem = measure_scale(robot, arm, approach, detector,
+                                              wrist, colour, above, where,
+                                              args.jog)
+            if problem:
+                print(f"  {problem}")
+                return "no scale"
+            print(f"      {np.linalg.norm(scale[:, 0]):.2f} and "
+                  f"{np.linalg.norm(scale[:, 1]):.2f} px/mm")
+        else:
+            # Measured once, up where there is room to take a clean step, and
+            # reused on the way down. Close to the table the two directions come
+            # out nearly parallel and inverting that is hopeless - but with the
+            # wrist held still the shape of the mapping does not change as the
+            # arm descends, only its size, and the loop is iterative enough not
+            # to care about the size being a fifth out.
+            print(f"  reusing the scale measured higher up")
 
         print("  closing in")
         error_px = servo(robot, arm, approach, detector, wrist, colour, above,
@@ -437,9 +466,13 @@ def pick_one(robot, arm, approach, detector, cameras, side, wrist, table,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--colour", required=True)
+    parser.add_argument("--colour", required=True, nargs="+",
+                        help="colour(s) to move, tried in turn in one camera "
+                             "session - opening the cameras once per attempt "
+                             "wedges them after a few runs, and clearing that "
+                             "needs the USB unplugged")
     parser.add_argument("--count", type=int, default=1,
-                        help="how many blocks of that colour to move")
+                        help="how many blocks of each colour to move")
     parser.add_argument("--hover", type=float, default=HOVER_M)
     parser.add_argument("--stages", type=float, nargs="+", default=STAGES_M,
                         help="heights above the grasp to line the block up at")
@@ -504,13 +537,13 @@ def main():
         cameras.wait_for_frames(timeout=25)
         side = cameras.streams[args.side]
         wrist = cameras.streams[args.wrist]
-        for number in range(1, args.count + 1):
-            print(f"\n  --- {number}/{args.count} ---")
-            results.append(pick_one(robot, arm, approach, detector, cameras,
-                                    side, wrist, table, home, args.colour,
-                                    jaw_offset, where, args))
-            if results[-1] in ("not on the table", "unreachable"):
-                break
+        attempts = [colour for colour in args.colour
+                    for _ in range(args.count)]
+        for index, colour in enumerate(attempts, 1):
+            print(f"\n  --- {index}/{len(attempts)}: {colour} ---")
+            results.append((colour, pick_one(
+                robot, arm, approach, detector, cameras, side, wrist,
+                table, home, colour, jaw_offset, where, args)))
     finally:
         cameras.stop()
         try:
@@ -526,10 +559,13 @@ def main():
 
     if results:
         print()
-        for number, result in enumerate(results, 1):
-            print(f"  {number}. {result}")
-        print(f"\n  {sum(1 for r in results if r == 'in the can')} of "
-              f"{len(results)} into the can")
+        for colour, result in results:
+            print(f"  {colour:<10}{result}")
+        closed = [r for _, r in results
+                  if r in ("in the can", "missed", "knocked aside")]
+        landed = sum(1 for _, r in results if r == "in the can")
+        print(f"\n  {landed} into the can, of {len(closed)} that got as far as closing"
+              f"   ({len(results)} attempted)")
 
 
 if __name__ == "__main__":

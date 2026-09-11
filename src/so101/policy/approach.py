@@ -170,7 +170,7 @@ class ApproachPoses:
                  for name in self.joint_names},
                 float(distances[nearest[0]]))
 
-    def refine(self, pose, position, tolerance_mm=5.0):
+    def refine(self, pose, position, tolerance_mm=5.0, frozen=()):
         """Nudge an existing pose onto a nearby position, keeping its posture.
 
         Looking a pose up afresh for a point a couple of centimetres away can
@@ -183,6 +183,7 @@ class ApproachPoses:
             seed_deg={name: pose[name] for name in self.arm.joint_names},
             tolerance_mm=tolerance_mm,
             orientation=None,
+            frozen=frozen,
         )
         if solution is None:
             return None

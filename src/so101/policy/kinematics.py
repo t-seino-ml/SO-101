@@ -93,7 +93,16 @@ class ArmKinematics:
         return self.chain.forward_kinematics(
             self._to_chain(joints_deg, clamp=False))[:3, 3]
 
-    def inverse(self, position, seed_deg=None, tolerance_mm=2.0, orientation=DOWN):
+    def frozen_mask(self, frozen):
+        """The chain's active-link mask with these joints held still."""
+        mask = list(self.chain.active_links_mask)
+        first = ACTIVE_SLICE.indices(len(self.chain.links))[0]
+        for name in frozen:
+            mask[first + self.joint_names.index(name)] = False
+        return mask
+
+    def inverse(self, position, seed_deg=None, tolerance_mm=2.0, orientation=DOWN,
+                frozen=()):
         """Joint angles that put the gripper frame at `position`.
 
         `orientation` constrains the tool's approach axis - by default straight
@@ -105,6 +114,8 @@ class ArmKinematics:
         seeding it from where the arm already is keeps the solution near the
         current configuration instead of jumping across the workspace.
 
+        `frozen` names joints to leave exactly where the seed has them.
+
         Returns None when the solver cannot reach the target within tolerance,
         rather than handing back a pose that quietly misses.
         """
@@ -113,8 +124,21 @@ class ArmKinematics:
             "target_orientation": np.asarray(orientation, float),
             "orientation_mode": "Z",
         }
-        solution = self.chain.inverse_kinematics(np.asarray(position, float),
-                                                 initial_position=seed, **kwargs)
+        # Holding a joint still is not only a way to keep the wrist steady: it
+        # stops the solver answering two nearby targets with two quite different
+        # postures, which is what makes a measured image Jacobian stale by the
+        # time it is used.
+        previous = self.chain.active_links_mask
+        if frozen:
+            if seed is None:
+                raise ValueError("freezing a joint needs a seed to freeze it at")
+            self.chain.active_links_mask = self.frozen_mask(frozen)
+        try:
+            solution = self.chain.inverse_kinematics(np.asarray(position, float),
+                                                     initial_position=seed,
+                                                     **kwargs)
+        finally:
+            self.chain.active_links_mask = previous
         reached = self.chain.forward_kinematics(solution)[:3, 3]
         error_mm = 1000 * float(np.linalg.norm(reached - np.asarray(position, float)))
         if error_mm > tolerance_mm:
