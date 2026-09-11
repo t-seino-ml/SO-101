@@ -29,6 +29,43 @@ NEIGHBOURS = 3
 EPSILON_M = 0.005        # keeps a target sitting exactly on a sample finite
 
 
+CLOSE_DEG = 3.0          # a drop this large counts as the jaws closing
+LOOK_BACK_S = 0.5        # over this long
+LIFT_S = 1.5             # and the lift that follows is judged over this long
+
+
+def grasp_frame(gripper, heights, fps=30):
+    """The frame where the jaws closed on a block.
+
+    Taking the episode's narrowest gripper reading is close but not right: a few
+    episodes begin with the jaws already shut and never close that far again, so
+    the narrowest frame is the first one, before anything has been approached.
+
+    What distinguishes a grasp is what follows it. The jaws close and then the
+    arm rises with the block; closing on air is followed by nothing. So among
+    the frames where the jaws have just shut, this takes the one after which the
+    gripper climbs the furthest.
+    """
+    gripper = np.asarray(gripper, float)
+    heights = np.asarray(heights, float)
+    back = max(1, int(LOOK_BACK_S * fps))
+    ahead = max(2, int(LIFT_S * fps))
+
+    best, best_rise = None, -np.inf
+    for index in range(back, len(gripper) - 1):
+        if gripper[index - back] - gripper[index] < CLOSE_DEG:
+            continue
+        if gripper[index + 1] < gripper[index] - 0.5:
+            continue                      # still closing; wait for it to settle
+        after = heights[index:index + ahead]
+        rise = float(after.max() - heights[index]) if len(after) else 0.0
+        if rise > best_rise:
+            best, best_rise = index, rise
+    if best is None:
+        best = int(np.argmin(gripper))    # nothing looked like a grasp
+    return best
+
+
 class ApproachPoses:
     """Where to put the arm to reach a given spot on the table."""
 
@@ -51,9 +88,9 @@ class ApproachPoses:
     def from_demos(cls, root=DEFAULT_ROOT, kinematics=None):
         """One pose per episode: where the arm was when the jaws closed.
 
-        The gripper reaches its narrowest once per episode, on the block. That
-        frame is the one worth keeping - it is the pose the whole approach was
-        aiming at.
+        The frame is picked by `grasp_frame`: the jaws shutting and the arm
+        then rising with what they hold. That pose is the one worth keeping - it
+        is what the whole approach was aiming at.
         """
         import pandas as pd
 
@@ -68,11 +105,16 @@ class ApproachPoses:
         frames = frames.sort_values(["episode_index", "frame_index"])
 
         arm = kinematics or ArmKinematics()
+        fps = info.get("fps", 30)
         positions, poses = [], []
         for _, rows in frames.groupby("episode_index"):
             states = np.stack(rows["observation.state"].to_numpy())
-            closed = states[int(np.argmin(states[:, gripper]))]
-            pose = {name: float(closed[index]) for index, name in enumerate(names)}
+            tips = np.array([arm.forward({name: float(state[index])
+                                          for index, name in enumerate(names)
+                                          if name in arm.joint_names})
+                             for state in states])
+            held = states[grasp_frame(states[:, gripper], tips[:, 2], fps)]
+            pose = {name: float(held[index]) for index, name in enumerate(names)}
             positions.append(arm.forward({name: pose[name]
                                           for name in arm.joint_names}))
             poses.append(pose)

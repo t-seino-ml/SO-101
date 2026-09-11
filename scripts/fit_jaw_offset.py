@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from so101.policy import ArmKinematics, BlockDetector, TableFrame
+from so101.policy.approach import grasp_frame
 
 OFFSET_PATH = Path("data/jaw_offset.json")
 SAME_BLOCK_MM = 25.0     # nearer than this at both starts is the same block
@@ -83,16 +84,23 @@ def main():
         """What the side camera sees at the start of an episode."""
         index = int(meta.episodes["dataset_from_index"][episode])
         image = dataset[index][camera].numpy()
-        image = (image.transpose(1, 2, 0) * 255).astype(np.uint8)
+        # The dataset holds RGB; the detector was trained on what cv2
+        # reads, which is BGR. Handing it RGB swaps red for blue and
+        # every colour label with it.
+        image = (image.transpose(1, 2, 0) * 255).astype(np.uint8)[:, :, ::-1]
         return [(d.colour, d.position) for d in detector.detect(image)
                 if d.confidence >= MIN_CONFIDENCE and d.position is not None]
 
     grasps = {}
     for episode, rows in frames.groupby("episode_index"):
         states = np.stack(rows["observation.state"].to_numpy())
-        closed = states[int(np.argmin(states[:, gripper]))]
+        tips = np.array([arm.forward({name: float(state[i])
+                                      for i, name in enumerate(names)
+                                      if name in arm.joint_names})
+                         for state in states])
+        held = states[grasp_frame(states[:, gripper], tips[:, 2], meta.fps)]
         grasps[int(episode)] = arm.forward(
-            {name: float(closed[index]) for index, name in enumerate(names)
+            {name: float(held[index]) for index, name in enumerate(names)
              if name in arm.joint_names})
 
     print(f"\n  {'episode':>8}{'grasped':>10}{'offset x':>11}{'y':>8}{'z':>8}")
