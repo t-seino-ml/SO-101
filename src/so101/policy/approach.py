@@ -32,6 +32,20 @@ EPSILON_M = 0.005        # keeps a target sitting exactly on a sample finite
 CLOSE_DEG = 3.0          # a drop this large counts as the jaws closing
 LOOK_BACK_S = 0.5        # over this long
 LIFT_S = 1.5             # and the lift that follows is judged over this long
+RELEASE_DEG = 8.0        # the jaws opening this much again is the release
+
+
+def release_frame(gripper, grasped, fps=30):
+    """The frame where the jaws opened again, dropping what they carried.
+
+    Everything the arm does between the grasp and this is carrying, so the pose
+    here is where the can was - which is worth knowing without measuring the can
+    or asking anyone where it is.
+    """
+    gripper = np.asarray(gripper, float)
+    opened = gripper[grasped] + RELEASE_DEG
+    after = np.nonzero(gripper[grasped + 1:] > opened)[0]
+    return int(grasped + 1 + after[0]) if len(after) else len(gripper) - 1
 
 
 def grasp_frame(gripper, heights, fps=30):
@@ -69,11 +83,25 @@ def grasp_frame(gripper, heights, fps=30):
 class ApproachPoses:
     """Where to put the arm to reach a given spot on the table."""
 
-    def __init__(self, positions, poses, joint_names, kinematics=None):
+    def __init__(self, positions, poses, joint_names, kinematics=None,
+                 releases=None):
         self.positions = np.asarray(positions, float)   # (n, 3) in the arm frame
         self.poses = list(poses)                        # [{joint: degrees}]
         self.joint_names = list(joint_names)
         self.arm = kinematics or ArmKinematics()
+        self.releases = list(releases or [])
+
+    def over_the_can(self):
+        """The pose the demonstrations were in when they let a block go.
+
+        The can did not move while they were recorded, so the middle of those
+        poses is where it is. Nothing has to be told the can's position, and
+        nothing has to detect it.
+        """
+        if not self.releases:
+            return None
+        return {name: float(np.median([pose[name] for pose in self.releases]))
+                for name in self.joint_names}
 
     def __len__(self):
         return len(self.poses)
@@ -106,19 +134,24 @@ class ApproachPoses:
 
         arm = kinematics or ArmKinematics()
         fps = info.get("fps", 30)
-        positions, poses = [], []
+        positions, poses, releases = [], [], []
         for _, rows in frames.groupby("episode_index"):
             states = np.stack(rows["observation.state"].to_numpy())
             tips = np.array([arm.forward({name: float(state[index])
                                           for index, name in enumerate(names)
                                           if name in arm.joint_names})
                              for state in states])
-            held = states[grasp_frame(states[:, gripper], tips[:, 2], fps)]
+            closed = grasp_frame(states[:, gripper], tips[:, 2], fps)
+            held = states[closed]
             pose = {name: float(held[index]) for index, name in enumerate(names)}
             positions.append(arm.forward({name: pose[name]
                                           for name in arm.joint_names}))
             poses.append(pose)
-        return cls(positions, poses, names, arm)
+
+            let_go = states[release_frame(states[:, gripper], closed, fps)]
+            releases.append({name: float(let_go[index])
+                             for index, name in enumerate(names)})
+        return cls(positions, poses, names, arm, releases)
 
     def blend(self, position, neighbours=NEIGHBOURS):
         """The nearby demonstrated poses, weighted by how near they are.
