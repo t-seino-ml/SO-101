@@ -117,6 +117,7 @@ def main():
     approach = ApproachPoses.from_demos(args.demos, kinematics=arm)
     detector = BlockDetector(weights=args.weights)
     detector.warmup()
+    print(f"  detector: {detector.weights}")
     print(f"  {approach}")
 
     cameras = CameraSet.from_config()

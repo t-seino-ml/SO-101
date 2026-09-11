@@ -101,6 +101,7 @@ class BlockDetector:
         if device is None:
             device = 0 if torch.cuda.is_available() else "cpu"
         self.device = device
+        self.weights = weights
         self.model = YOLO(str(weights))
         self.model.to(device if device == "cpu" else f"cuda:{device}")
         self.table_frame = table_frame
