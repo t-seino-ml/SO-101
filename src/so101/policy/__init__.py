@@ -14,9 +14,11 @@ learn perception and control jointly, which is what makes a small dataset enough
 
 from .detector import BlockDetector, find_weights, Detection
 from .pick_place import PickPlace, PickResult
+from .approach import ApproachPoses
 from .kinematics import ArmKinematics
 from .table_frame import TableFrame
 
-__all__ = ["ArmKinematics", "BlockDetector",
+__all__ = ["ArmKinematics", "ApproachPoses",
+    "BlockDetector",
     "find_weights", "Detection", "PickPlace",
            "PickResult", "TableFrame"]
