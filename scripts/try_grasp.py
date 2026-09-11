@@ -43,6 +43,7 @@ HOVER_M = 0.06           # how far above the grasp pose to arrive first
 LIFT_M = 0.05            # how far to lift once closed
 MIN_CONFIDENCE = 0.5
 MOVED_MM = 15.0          # how far a block must shift to count as picked up
+HOLDING_DEG = 2.0        # jaws this far short of their command are on something
 SETTLE_S = 1.0
 LOAD_ABORT = 700
 
@@ -181,8 +182,9 @@ def main():
         glide_to(robot, {**at_block, "gripper": grip}, seconds=1.2)
         time.sleep(SETTLE_S)
         held = joints_of(robot)["gripper"]
-        print(f"  gripper settled at {held:.0f} deg "
-              f"({'something is between the jaws' if held > grip + 2 else 'closed on nothing'})")
+        blocked = held > grip + HOLDING_DEG
+        print(f"  gripper settled at {held:.0f} deg, commanded {grip:.0f} "
+              f"({'blocked by something' if blocked else 'closed on nothing'})")
 
         print("  lifting")
         glide_to(robot, {**lifted, "gripper": grip}, seconds=1.5)
@@ -197,14 +199,34 @@ def main():
             cv2.imwrite(str(args.out / f"held_{role}.png"), stream.read().image)
         print(f"  photographed while held: {args.out}")
 
+        # Carry it clear before looking again. Lifted, the arm stands between
+        # the side camera and the spot it just left, and a block hidden behind
+        # the arm reads exactly like a block that has been picked up - which is
+        # how three failures first reported themselves as successes.
+        print("  carrying clear of the camera")
+        glide_to(robot, {**home, "gripper": grip}, seconds=2.0)
+        time.sleep(1.5)
+        for role, stream in cameras.streams.items():
+            cv2.imwrite(str(args.out / f"carried_{role}.png"), stream.read().image)
+
         after = blocks_on_table(detector, side, table, args.margin_mm)
         still_there = [p for c, p, _ in after if c == colour]
         gone = (not still_there or
                 min(1000 * np.linalg.norm(target - p) for p in still_there) > MOVED_MM)
-        print(f"\n  the side camera now sees {len(after)} block(s) "
-              f"({len(before)} before)")
-        print(f"  {'PICKED UP' if gone else 'still on the table'}: the {colour} "
-              f"block is {'no longer where it was' if gone else 'where it was'}")
+
+        print(f"\n  jaws blocked: {'yes' if blocked else 'no'}")
+        print(f"  {colour} block left its spot: {'yes' if gone else 'no'}"
+              f"   ({len(after)} block(s) visible, {len(before)} before)")
+        # Both have to agree. The jaws alone cannot tell a block from a stray
+        # finger of the gripper's own travel, and the camera alone cannot tell
+        # a lift from a nudge - or from the arm standing in front of the block.
+        if blocked and gone:
+            print("  PICKED UP")
+        elif gone:
+            print("  KNOCKED ASIDE - the block moved but the jaws closed on "
+                  "nothing")
+        else:
+            print("  MISSED")
     finally:
         cameras.stop()
         try:
