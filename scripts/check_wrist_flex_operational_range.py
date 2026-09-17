@@ -75,6 +75,13 @@ POSTURES = {
 #: enough that stopping between two commands costs a fraction of a degree.
 WRIST_SPEED_DEG_S = 8.0
 TRANSIT_SPEED_DEG_S = 5.0
+#: The arm starts folded, resting against itself - the twin reports the
+#: shoulder and the lower arm already in contact at the pose it is found in.
+#: Coming out of that is the one moment in the run where a joint might be
+#: pushing something rather than swinging free, so the first slice of the
+#: transit is taken at a crawl and looked at before the rest of it runs.
+BREAKOUT_FRACTION = 0.08
+BREAKOUT_SPEED_DEG_S = 1.5
 #: Written into the servos' Goal_Velocity, and restored to 0 afterwards. It is
 #: a ceiling under the interpolation rather than the thing that sets the speed:
 #: a servo held at its velocity limit lags its command, and a lag is what the
@@ -237,6 +244,13 @@ def joints_of(robot):
 
 def ticks_for(deg, arm, joint=JOINT):
     return arm[joint]["mid_ticks"] + deg * TICKS_PER_DEG
+
+
+def transit_times(biggest_deg):
+    """(unfolding, the rest) in seconds, for a transit whose largest joint
+    moves `biggest_deg`."""
+    return (max(3.0, biggest_deg * BREAKOUT_FRACTION / BREAKOUT_SPEED_DEG_S),
+            max(6.0, biggest_deg * (1 - BREAKOUT_FRACTION) / TRANSIT_SPEED_DEG_S))
 
 
 # -------------------------------------------------------------------------
@@ -502,9 +516,9 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
     to_min = target - wrist["min_deg"]
     to_max = wrist["max_deg"] - target
     operational = LIMIT_DEG
-    transit = {name: posture[name] - arm[name]["deg"] for name in posture}
-    biggest = max(abs(v) for v in transit.values())
-    transit_s = max(6.0, biggest / TRANSIT_SPEED_DEG_S)
+    goal = dict(posture, wrist_flex=SAFE_DEG)
+    biggest = max(abs(goal[name] - arm[name]["deg"]) for name in goal)
+    unfold_s, rest_s = transit_times(biggest)
     wrist_s = max(3.0, abs(target - SAFE_DEG) / WRIST_SPEED_DEG_S)
 
     log("\n  --- where the arm is now (read-only, torque untouched) ---")
@@ -540,7 +554,10 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
         f"margin) - not written by this script")
 
     log(f"\n  --- speed and time ---")
-    log(f"    transit to the posture        {transit_s:.1f} s "
+    log(f"    unfolding, the first {100*BREAKOUT_FRACTION:.0f}%      "
+        f"{unfold_s:.1f} s at {BREAKOUT_SPEED_DEG_S:.1f} deg/s, then it stops "
+        f"and waits")
+    log(f"    the rest of the transit       {rest_s:.1f} s "
         f"at {TRANSIT_SPEED_DEG_S:.0f} deg/s, interpolated at {FPS} Hz")
     log(f"    wrist_flex {SAFE_DEG:+.0f} -> {target:+.0f}          "
         f"{wrist_s:.1f} s at {WRIST_SPEED_DEG_S:.0f} deg/s")
@@ -548,7 +565,8 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
         f"sampled at {SAMPLE_HZ} Hz")
     log(f"    repeats                       {args.repeats} "
         f"(return to {SAFE_DEG:+.0f} deg between them)")
-    total = transit_s + args.repeats * (2 * wrist_s + args.hold) + transit_s
+    total = (unfold_s + rest_s + args.repeats * (2 * wrist_s + args.hold)
+             + unfold_s + rest_s)
     log(f"    estimated total               {total:.0f} s, arm moving")
     log(f"    Goal_Velocity written         {GOAL_VELOCITY_DEG_S:.0f} deg/s "
         f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s), restored to 0 "
@@ -568,6 +586,21 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
         f"moving {STALL_MOVEMENT_DEG:.1f} deg for {STALL_WINDOW_S:.0f} s")
     log("    None of these is a safe level. A noise, a vibration or anything")
     log("    that looks wrong is a reason to stop whatever the numbers say.")
+
+    log("\n  --- what happens when one of them does ---")
+    log("    1. every joint's Present_Position is read, in ticks")
+    log("    2. Goal_Position is rewritten to that same Present_Position")
+    log(f"       - so the arm holds where it IS, not where it was last told to")
+    log(f"         be. Cutting the interpolation alone would leave the servo")
+    log(f"         pushing towards the command it had just failed to meet.")
+    log("    3. no further trajectory is commanded")
+    log("    4. torque stays ON - releasing a raised arm drops it")
+    log("    5. every joint's position, goal, load, temperature, voltage and")
+    log(f"       torque state is printed and written to summary.json")
+    log(f"    then it asks. After an abort, folding the arm back needs the word")
+    log(f"    'home' typed - ENTER alone leaves it holding.")
+    log(f"    If the bus will not answer, it says so and tells you to use")
+    log(f"    scripts/torque_off.py, which is the only case where that is right.")
 
     log(f"\n  --- where it writes ---")
     log(f"    output directory              {out_dir}"
@@ -746,14 +779,33 @@ def run(args, arm, posture, port, out_dir, log):
         log(f"  reads back at {', '.join(f'{n} {here[n]:+.1f}' for n in ARM_JOINTS)}")
 
         # -- 1. to the posture --------------------------------------------
-        biggest = max(abs(posture[n] - here[n]) for n in posture)
-        seconds = max(6.0, biggest / TRANSIT_SPEED_DEG_S)
-        log(f"\n  --- transit to {args.posture!r}, {seconds:.1f} s, "
-            f"largest move {biggest:.1f} deg ---")
+        goal = dict(posture, wrist_flex=SAFE_DEG)
+        biggest = max(abs(goal[n] - here[n]) for n in goal)
+        unfold_s, rest_s = transit_times(biggest)
+        log(f"\n  --- transit to {args.posture!r}, largest move "
+            f"{biggest:.1f} deg ---")
+        log(f"  in two parts. The first {100*BREAKOUT_FRACTION:.0f}% "
+            f"({biggest * BREAKOUT_FRACTION:.1f} deg) goes at "
+            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s, because that is the arm")
+        log(f"  unfolding out of a pose it is resting against itself in; the "
+            f"rest at {TRANSIT_SPEED_DEG_S:.0f} deg/s.")
         if input("  Press ENTER to move, anything else to stop: ").strip():
             raise KeyboardInterrupt
-        goal = dict(posture, wrist_flex=SAFE_DEG)
-        glide(robot, watch, goal, seconds, "transit", 0, log)
+
+        part = {n: here[n] + (goal[n] - here[n]) * BREAKOUT_FRACTION
+                for n in goal}
+        glide(robot, watch, part, unfold_s, "unfold", 0, log)
+        broke_out = joints_of(robot)
+        log("  out of the fold: "
+            + ", ".join(f"{n} {broke_out[n]:+.2f}" for n in ARM_JOINTS))
+        log(f"    wrist_flex load {watch.rows[-1]['load']}, "
+            f"{watch.rows[-1]['temperature_c']} C, "
+            f"tracking {watch.rows[-1]['tracking_error_deg']:+.2f} deg")
+        if input("  Nothing odd? ENTER to continue, anything else to stop: "
+                 ).strip():
+            raise KeyboardInterrupt
+
+        glide(robot, watch, goal, rest_s, "transit", 0, log)
         arrived = joints_of(robot)
         log(f"  arrived: " + ", ".join(f"{n} {arrived[n]:+.2f}" for n in ARM_JOINTS))
         result["posture_reached_deg"] = {n: round(arrived[n], 2)
@@ -794,20 +846,21 @@ def run(args, arm, posture, port, out_dir, log):
     except Abort as error:
         aborted = str(error)
         log(f"\n  *** ABORT: {error} ***")
-        log("  Motion stopped. Torque is still ON and the arm is holding.")
-        log("  Look at it before anything else.")
+        result["freeze"] = freeze(robot, log, watch, aborted)
     except KeyboardInterrupt:
         aborted = "stopped by the operator"
-        log("\n  stopped. Torque is still on and the arm is holding.")
+        log("\n  stopped by the operator")
+        result["freeze"] = freeze(robot, log, watch, aborted)
     except Exception as error:  # noqa: BLE001
         aborted = f"{type(error).__name__}: {error}"
         log(f"\n  *** {aborted} ***")
+        result["freeze"] = freeze(robot, log, watch, aborted)
     finally:
         result["aborted"] = aborted
         result["finished_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
         if robot is not None:
-            park(robot, watch, home, goal_velocity, log)
+            park(robot, watch, home, goal_velocity, log, aborted)
             try:
                 robot.disconnect()
                 log("  disconnected; torque released")
@@ -823,7 +876,93 @@ def run(args, arm, posture, port, out_dir, log):
         log.close()
 
 
-def park(robot, watch, home, goal_velocity, log):
+FREEZE_ATTEMPTS = 3
+FREEZE_RETRIES = 5
+
+
+def freeze(robot, log, watch=None, reason=""):
+    """Stop by making where the arm *is* the thing it is asked to hold.
+
+    Cutting the interpolation is not stopping. The last Goal_Position is still
+    standing in the servo, and a servo goes on pushing towards its goal for as
+    long as it has torque - so a joint that was aborted because it had fallen
+    behind its command is left leaning on exactly the command it could not
+    meet. Whatever stopped it, it keeps pulling against.
+
+    So the goal is overwritten with the present position, all six joints at
+    once, before anything is reported or decided. The arm then holds where it
+    actually is rather than where it was last told to be. Torque stays on: this
+    is the wrong moment to drop a raised arm, and dropping it is what releasing
+    torque means.
+
+    Ticks rather than degrees, in both directions. A degree round-trip goes
+    through the calibration midpoint and back and lands a tick or two out, and
+    a tick or two of "hold still" is not holding still.
+    """
+    if robot is None:
+        return {"frozen": False, "why": "never connected"}
+
+    for attempt in range(1, FREEZE_ATTEMPTS + 1):
+        try:
+            ticks = robot.bus.sync_read("Present_Position", normalize=False,
+                                        num_retry=FREEZE_RETRIES)
+            robot.bus.sync_write("Goal_Position", ticks, normalize=False,
+                                 num_retry=FREEZE_RETRIES)
+            break
+        except Exception as error:  # noqa: BLE001 - keep trying, then say so
+            log(f"  freeze attempt {attempt}/{FREEZE_ATTEMPTS} failed: {error}")
+    else:
+        log("\n  *** COULD NOT FREEZE - the arm may still be driving towards "
+            "its last command ***")
+        log("  Support the arm, then in the other terminal:")
+        log("    taskkill /F /IM python.exe")
+        log("    uv run scripts/torque_off.py COM4")
+        return {"frozen": False, "why": "the bus would not answer"}
+
+    log("  frozen: Goal_Position rewritten to Present_Position on all six "
+        "joints; torque stays ON and the arm holds where it is")
+    state = {"frozen": True, "reason": reason, "joints": {}}
+    log(f"    {'joint':<15}{'deg':>9}{'ticks':>8}{'goal':>8}{'load':>7}"
+        f"{'temp':>7}{'volt':>7}{'torque':>8}")
+    for name in (*ARM_JOINTS, "gripper"):
+        row = {}
+        for register, key in (("Present_Position", "ticks"),
+                              ("Goal_Position", "goal"),
+                              ("Present_Load", "load"),
+                              ("Present_Temperature", "temperature_c"),
+                              ("Present_Voltage", "voltage"),
+                              ("Torque_Enable", "torque_enable")):
+            try:
+                row[key] = robot.bus.read(register, name, normalize=False,
+                                          num_retry=FREEZE_RETRIES)
+            except Exception:  # noqa: BLE001
+                row[key] = None
+        try:
+            row["deg"] = round(robot.bus.read("Present_Position", name,
+                                              num_retry=FREEZE_RETRIES), 3)
+        except Exception:  # noqa: BLE001
+            row["deg"] = None
+        if row["voltage"] is not None:
+            row["voltage_v"] = row.pop("voltage") / 10
+        state["joints"][name] = row
+        log(f"    {name:<15}"
+            f"{row['deg'] if row['deg'] is not None else float('nan'):>+9.2f}"
+            f"{str(row['ticks']):>8}{str(row['goal']):>8}"
+            f"{str(row['load']):>7}{str(row['temperature_c']):>6}C"
+            f"{row.get('voltage_v', 0):>6.1f}V{str(row['torque_enable']):>8}")
+
+    if watch is not None:
+        try:
+            watch.sample("frozen", 0, state["joints"][JOINT]["deg"] or 0.0,
+                         status="abort", notes=reason)
+        except Exception:  # noqa: BLE001 - the record is not worth a second fault
+            pass
+    log("\n  The arm is holding. Look at it - listen to it - before deciding "
+        "what to do.")
+    return state
+
+
+def park(robot, watch, home, goal_velocity, log, aborted=None):
     """Wrist to zero, arm back to where it was resting, then let go.
 
     The order is the point. Releasing torque with the arm straight up drops it
@@ -834,13 +973,27 @@ def park(robot, watch, home, goal_velocity, log):
     log("  The arm is raised. Releasing torque here would drop it, so it goes")
     log("  back to the folded pose it was found in first.")
     try:
-        if input("  Press ENTER to bring it home, or 'hold' to leave it "
-                 "holding: ").strip().lower() == "hold":
+        if aborted:
+            # After an abort the arm is holding a pose nobody planned, and the
+            # reason it stopped has not been looked at yet. Moving is then the
+            # answer that has to be asked for, not the one that happens by
+            # pressing ENTER.
+            log(f"  This run stopped early: {aborted}")
+            log("  Moving now is only safe once you know why.")
+            answer = input("  Type 'home' to fold it back, anything else to "
+                           "leave it holding: ").strip().lower()
+            if answer != "home":
+                log("  left holding, torque on. Lower it before cutting power.")
+                log("  when ready:  uv run scripts/torque_off.py COM4")
+                return
+        elif input("  Press ENTER to bring it home, or 'hold' to leave it "
+                   "holding: ").strip().lower() == "hold":
             log("  left holding, torque on. Lower it before cutting power.")
             log("  when ready:  uv run scripts/torque_off.py COM4")
             return
     except (EOFError, KeyboardInterrupt):
-        pass
+        log("  left holding, torque on.")
+        return
 
     try:
         here = joints_of(robot)
