@@ -109,6 +109,31 @@ def drive_until_enter(robot, teleop, label, hint, fps=60):
         time.sleep(max(0.0, period - (time.perf_counter() - started)))
 
 
+def connect_leader(teleop, port, attempts=3):
+    """Connect the leader, retrying a garbled first reply.
+
+    The SDK reads a ping's answer without checking it arrived whole, so one
+    truncated status packet raises IndexError out of SCS_MAKEWORD - below the
+    level `so101.hardware.bus_patch` retries at, and fatal. The arms are healthy
+    when it happens: diag.py reads all six servos a second later. This is the
+    same fragility bus_patch exists for, caught one layer further down.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            teleop.connect()
+            return
+        except Exception as error:  # noqa: BLE001 - any failure is worth a retry
+            print(f"  リーダ({port}) の接続 {attempt}/{attempts} 回目が失敗: "
+                  f"{type(error).__name__}: {error}")
+            if attempt == attempts:
+                raise SystemExit(
+                    f"\n  リーダ({port}) に接続できません。\n"
+                    "  電源と USB を確認してください。読み取りだけなら\n"
+                    f"    uv run scripts/diag.py {port}\n"
+                    "  で応答が見えます。フォロワには接続していません。\n")
+            time.sleep(1.5)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="リーダアームで展示用の軌道を教示して保存します")
@@ -186,13 +211,17 @@ def main():
     teleop = make_teleoperator_from_config(SO101LeaderConfig(
         port=leader_port, id="leader"))
 
+    # The leader first, and the follower only once the leader is talking. A
+    # leader that will not connect is a session that cannot happen, and there
+    # is no reason for the follower's torque to have come on to find that out.
+    connect_leader(teleop, leader_port)
+
     trajectory = Trajectory(
         name=name, slot=None if args.can else str(args.slot),
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
         note="taught with the leader arm; joint angles only")
     try:
         robot.connect()
-        teleop.connect()
         print("\n  接続しました。リーダで動かせます。")
         for phase, hint, seconds, _ in plan:
             pose = drive_until_enter(robot, teleop, phase, hint)
