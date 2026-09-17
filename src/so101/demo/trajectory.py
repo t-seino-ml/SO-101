@@ -58,6 +58,26 @@ SETTLE_SECONDS = 0.45
 #: joint held by something is not short because it sagged, and adding its error
 #: back round after round would just lean on whatever is stopping it.
 MAX_CORRECTION_DEG = 8.0
+#: How much further to close the jaws than the taught angle.
+#:
+#: Teaching recorded where the block stopped the jaws. Commanding exactly that
+#: closes the jaws to the block and no further, which is not a grip - the servo
+#: has arrived and stops pushing. So the command goes past it and the block
+#: stops the jaws instead, which is what holding something is. This is what
+#: `so101.policy.motion.GRIP_DEG` has always meant by "squeezed past where a
+#: block stops the jaws"; the gripper's own Max_Torque_Limit and
+#: Protection_Current are set low by LeRobot precisely so this is safe.
+SQUEEZE_DEG = 15.0
+#: A change in the taught gripper angle bigger than this is a close or an open,
+#: rather than the jaws drifting a few tenths between poses. Read from the
+#: taught numbers rather than from phase names, so a trajectory that closes
+#: somewhere unusual still squeezes there.
+GRIP_EVENT_DEG = 5.0
+#: Once squeezing, the jaws should end up this much wider than they were told -
+#: because something is between them. If they arrive where they were sent, they
+#: closed on air.
+HOLDING_MARGIN_DEG = 4.0
+
 #: Of 1023. `so101.policy.motion` aborts at 700; this is lower because a taught
 #: trajectory should meet nothing at all - anything it does meet is a surprise.
 LOAD_ABORT = 450
@@ -288,6 +308,32 @@ def freeze(robot, log=print):
 # playing
 # -------------------------------------------------------------------------
 
+def squeeze_plan(trajectory, squeeze_deg=SQUEEZE_DEG, gripper_min=None):
+    """What to command the jaws at each waypoint, so a grip is a grip.
+
+    The squeeze has to persist: closing at CLOSE and then commanding the taught
+    angle again at LIFT would let go of the block on the way up. So a close is
+    detected from the taught numbers, and every waypoint after it is squeezed
+    too until an open undoes it.
+    """
+    out, holding, previous = [], False, None
+    for point in trajectory.waypoints:
+        if point.gripper is None:
+            out.append(None)
+            continue
+        if previous is not None:
+            if point.gripper < previous - GRIP_EVENT_DEG:
+                holding = True
+            elif point.gripper > previous + GRIP_EVENT_DEG:
+                holding = False
+        value = point.gripper - squeeze_deg if holding else point.gripper
+        if gripper_min is not None:
+            value = max(value, gripper_min)
+        out.append(value)
+        previous = point.gripper
+    return out
+
+
 def _clamp(value, taught, limit):
     """A corrected command, kept near the taught angle and inside the servo."""
     low = taught - MAX_CORRECTION_DEG
@@ -315,8 +361,12 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
     """
     from ..policy.motion import glide_to
 
+    grips = squeeze_plan(trajectory, gripper_min=(
+        limits["gripper"]["min_deg"] + 1.0 if limits and "gripper" in limits
+        else None))
     records = []
     for index, point in enumerate(trajectory.waypoints, 1):
+        grip = grips[index - 1]
         here = joints_of(robot)
         step = max((abs(value - here[name])
                     for name, value in point.joints.items()), default=0.0)
@@ -328,12 +378,18 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
         seconds = max(0.4, point.seconds / max(speed, 1e-3))
         log(f"  [{index}/{len(trajectory.waypoints)}] {point.phase:<10} "
             f"最大 {step:5.1f} deg を {seconds:.1f} s"
-            + (f"   gripper → {point.gripper:+.0f}"
-               if point.gripper is not None else ""))
+            + ("" if grip is None else
+               f"   gripper → {grip:+.0f}"
+               + (f"（教示 {point.gripper:+.0f} より "
+                  f"{point.gripper - grip:.0f} deg 奥まで握り込み）"
+                  if abs(grip - point.gripper) > 0.1 else "")))
         if confirm is not None and not confirm(point):
             raise Unsafe("操作者が中止しました")
 
-        glide_to(robot, point.command(), seconds=seconds, fps=FPS)
+        opening = dict(point.joints)
+        if grip is not None:
+            opening["gripper"] = grip
+        glide_to(robot, opening, seconds=seconds, fps=FPS)
         time.sleep(point.settle_s)
 
         # Aim, look at where it actually went, and add the miss back into the
@@ -379,8 +435,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
                 f"{errors[worst]:+.2f} deg 手前 → 指令を "
                 f"{aim[worst] - point.joints[worst]:+.2f} deg ずらします")
             command = dict(aim)
-            if point.gripper is not None:
-                command["gripper"] = point.gripper
+            if grip is not None:
+                command["gripper"] = grip
             glide_to(robot, command, seconds=SETTLE_SECONDS, fps=FPS)
             time.sleep(point.settle_s)
 
@@ -393,12 +449,28 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             "corrections": corrections,
             "commanded_after_correction": {n: round(v, 2)
                                            for n, v in aim.items()},
-            "gripper_deg": round(reached.get("gripper", 0.0), 2),
+            "gripper_taught_deg": point.gripper,
+            "gripper_commanded_deg": None if grip is None else round(grip, 2),
+            "gripper_reached_deg": round(reached.get("gripper", 0.0), 2),
             "load": load, "load_joint": hot_joint,
             "temperature_c": temperature,
             "seconds": round(seconds, 2),
             "at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         }
+        # Did anything end up between the jaws? Only asked where the jaws were
+        # actually squeezed; elsewhere they are simply where they were put.
+        if grip is not None and grip < point.gripper - 0.1:
+            held = reached.get("gripper", 0.0) - grip
+            record["grasped"] = held >= HOLDING_MARGIN_DEG
+            record["grip_margin_deg"] = round(held, 2)
+            if record["grasped"]:
+                log(f"      掴みました（顎は指令より {held:.1f} deg 手前で"
+                    f"止まっています）")
+            else:
+                log(f"      *** 掴めていません。顎が指令どおり閉じきりました"
+                    f"（余り {held:.1f} deg < {HOLDING_MARGIN_DEG:.0f}）***")
+                log("      ブロックが Slot にあるか、位置がずれていないか"
+                    "確認してください。")
         records.append(record)
         log(f"      到達 {worst} {errors[worst]:+.2f} deg、負荷 {load}"
             f"（{hot_joint}）、{temperature} C"

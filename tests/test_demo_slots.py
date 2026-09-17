@@ -222,3 +222,50 @@ def test_the_correction_gives_up_rather_than_leaning_on_something():
     with pytest.raises(Unsafe, match="縮みません"):
         play(robot, _trajectory(elbow_flex=60.0), log=lambda *_: None)
     assert robot.pose["elbow_flex"] == pytest.approx(85.0),         "it must have stopped at the obstacle, not pushed past it"
+
+
+def _pick():
+    """A taught pick: jaws open, stopped by a block at 25.6, opened again."""
+    grips = [37.9, 37.9, 37.7, 25.6, 25.6, 25.6, 36.3]
+    names = ["HOME", "PREGRASP", "GRASP", "CLOSE", "LIFT", "CAN_ABOVE", "DROP"]
+    return Trajectory(name="slot1", waypoints=[
+        Waypoint(name, dict(POSE), gripper=grip)
+        for name, grip in zip(names, grips)])
+
+
+def test_the_jaws_are_commanded_past_where_the_block_stopped_them():
+    """Commanding exactly where the block is closes onto it, not around it."""
+    from so101.demo.trajectory import SQUEEZE_DEG, squeeze_plan
+
+    plan = squeeze_plan(_pick())
+    taught = [w.gripper for w in _pick().waypoints]
+    assert plan[3] == pytest.approx(taught[3] - SQUEEZE_DEG), "CLOSE must squeeze"
+    assert plan[:3] == taught[:3], "the open phases are left alone"
+
+
+def test_the_squeeze_is_held_all_the_way_to_the_can():
+    """Re-commanding the taught angle at LIFT would put the block down again."""
+    from so101.demo.trajectory import squeeze_plan
+
+    plan = squeeze_plan(_pick())
+    assert plan[4] == plan[3] == plan[5], "LIFT and CAN_ABOVE keep holding"
+    assert plan[6] == 36.3, "DROP lets go"
+
+
+def test_closing_on_air_is_noticed():
+    """Jaws that arrive where they were sent had nothing between them."""
+    robot = FakeRobot(POSE)          # goes exactly where told: nothing in the way
+    records = play(robot, _pick(), log=lambda *_: None)
+    assert records[3]["grasped"] is False
+
+
+def test_a_block_between_the_jaws_reads_as_held():
+    class Holding(FakeRobot):
+        def send_action(self, action):
+            super().send_action(action)
+            self.pose["gripper"] = max(self.pose["gripper"], 25.6)
+            return dict(action)
+
+    records = play(Holding(POSE), _pick(), log=lambda *_: None)
+    assert records[3]["grasped"] is True
+    assert records[3]["grip_margin_deg"] == pytest.approx(15.0, abs=0.1)
