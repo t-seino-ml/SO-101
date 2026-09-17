@@ -62,6 +62,7 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
 from contextlib import contextmanager  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -229,6 +230,27 @@ MOVING_BODIES = ("shoulder", "upper_arm", "lower_arm", "wrist", "gripper",
 
 class Abort(RuntimeError):
     """Something crossed a threshold. The run stops; the arm keeps holding."""
+
+
+@dataclass
+class Stage:
+    """One named move: its waypoints, and everything needed to fly and judge it.
+
+    Written down rather than worked out at each use. The live path used to read
+    `stages[0]` as the lift-off and `stages[2]` as the first sweep, which was
+    true only while there was always a lift-off stage; the moment one was not
+    needed, that indexing pointed at the wrong move. It also reached into
+    `path[-1]["elbow_flex"]` for a joint that is now chosen per pose. None of
+    that survives a stage knowing its own name.
+    """
+
+    label: str
+    path: list          # waypoints, each a dict of joint -> degrees
+    kind: str           # "transit" - may not approach the table
+                        # "sweep"   - lowers the gripper on purpose, held to the floor
+    speed: float        # degrees per second between waypoints
+    subject: str        # the joint this stage is about, for the log and the watch
+    note: str = ""      # what to tell the operator before it runs
 
 
 # -------------------------------------------------------------------------
@@ -590,13 +612,16 @@ def sensitivities(table, start, probe_deg=2.0):
     reason the gripper reached the table was a path built on an assumption about
     that which stopped being true.
     """
-    here = table.gap(start)
+    # The gripper's clearance, not the arm's lowest point. Once the wrist is
+    # up the lowest point is the shoulder, which no joint moves - so every
+    # sensitivity comes out as exactly zero and the table says nothing at all.
+    here = table.gripper_gap(start)
     out = {}
     for name in LIFT_CANDIDATES:
         for sign in (+1, -1):
             pose = dict(start)
             pose[name] += sign * probe_deg
-            out[(name, sign)] = (table.gap(pose) - here) / probe_deg
+            out[(name, sign)] = (table.gripper_gap(pose) - here) / probe_deg
     return out
 
 
@@ -789,7 +814,8 @@ def check_path_shape(stages, start, log):
     ok = True
     log("    " + pad("stage", 30) + rpad("最大の 1 歩", 14)
         + rpad("向きの反転", 12) + "   判定")
-    for label, path, _kind in stages:
+    for stage in stages:
+        label, path = stage.label, stage.path
         biggest, reversals, where = 0.0, 0, ""
         previous = dict(start)
         directions = {}
@@ -819,7 +845,8 @@ def check_path_shape(stages, start, log):
 def check_limits(stages, arm, log):
     """Is every waypoint inside the servos' own limits? Returns True if so."""
     worst = {}
-    for label, path, _kind in stages:
+    for stage in stages:
+        label, path = stage.label, stage.path
         for index, point in enumerate(path, 1):
             for name, value in point.items():
                 low = arm[name]["min_deg"] + LIMIT_MARGIN_DEG
@@ -895,7 +922,8 @@ def replay(stages, start, table, log, fine=6):
               "start_clearance_mm": round(1000 * parked, 2),
               "start_gripper_clearance_mm": round(1000 * start_grip, 2),
               "stages": []}
-    for label, path, kind in stages:
+    for stage in stages:
+        label, path, kind = stage.label, stage.path, stage.kind
         least, least_grip = float("inf"), float("inf")
         least_support, support_closed_at = float("inf"), None
         offenders, worst_at, closed_at, below_at = set(), None, None, None
@@ -989,7 +1017,7 @@ def replay(stages, start, table, log, fine=6):
         report["min_support_distance_mm"] = min(
             s["min_support_distance_mm"] for s in report["stages"])
         report["support_margin_mm"] = SUPPORT_MARGIN_MM
-        ends = table.survey({**start, **stages[-1][1][-1]})["support"]
+        ends = table.survey({**start, **stages[-1].path[-1]})["support"]
         report["end_support_distance_mm"] = round(1000 * ends, 2)
         report["leaves_support"] = bool(1000 * ends >= SUPPORT_MARGIN_MM)
         if not report["leaves_support"]:
@@ -1033,7 +1061,13 @@ def stages_for(start, posture, target_deg, repeats, posture_only,
     out = []
     lifted = dict(start)
     if liftoff:
-        out.append(("離陸（机から離す）", waypoints(start, liftoff), "transit"))
+        joint = max(liftoff, key=lambda n: abs(liftoff[n] - start[n]))
+        out.append(Stage(
+            "離陸（机から離す）", waypoints(start, liftoff), "transit",
+            LIFTOFF_SPEED_DEG_S, joint,
+            note="グリッパを机から離す区間です。ここで動かすのは、この姿勢で"
+                 "実際に持ち上がる関節だけで、下げる向きの関節は余裕ができる"
+                 "まで一切指令しません。"))
         lifted.update(liftoff)
     if fraction < 1.0:
         # Part of the way and stop. The waypoints are a straight line in joint
@@ -1045,16 +1079,20 @@ def stages_for(start, posture, target_deg, repeats, posture_only,
         label = f"{posture_name} へ {100*fraction:.0f}% だけ"
     else:
         label = f"{posture_name} へ"
-    out.append((label, waypoints(lifted, upright), "transit"))
+    moves = {n: abs(upright[n] - lifted[n]) for n in upright}
+    out.append(Stage(label, waypoints(lifted, upright), "transit",
+                     TRANSIT_SPEED_DEG_S, max(moves, key=moves.get)))
     if posture_only:
         return out
     here = dict(upright)
     for repeat in range(1, repeats + 1):
-        out.append((f"{repeat} 回目: wrist_flex → {target_deg:+.0f}",
-                    waypoints(here, {JOINT: target_deg}), "sweep"))
+        out.append(Stage(f"{repeat} 回目: wrist_flex → {target_deg:+.0f}",
+                         waypoints(here, {JOINT: target_deg}), "sweep",
+                         WRIST_SPEED_DEG_S, JOINT))
         here[JOINT] = target_deg
-        out.append((f"{repeat} 回目: wrist_flex → {SAFE_DEG:+.0f}",
-                    waypoints(here, {JOINT: SAFE_DEG}), "sweep"))
+        out.append(Stage(f"{repeat} 回目: wrist_flex → {SAFE_DEG:+.0f}",
+                         waypoints(here, {JOINT: SAFE_DEG}), "sweep",
+                         WRIST_SPEED_DEG_S, JOINT))
         here[JOINT] = SAFE_DEG
     return out
 
@@ -1423,7 +1461,8 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
 
     log("\n  --- 送信する waypoint 列（ツインが再生したものと同一）---")
     total = 0
-    for label, path, _kind in stages:
+    for stage in stages:
+        label, path = stage.label, stage.path
         total += len(path)
         biggest = 0.0
         previous = None
@@ -1548,6 +1587,43 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
     log("\n  --- この計画に対するツインの判定 ---")
     log(f"    {'問題なし' if clear else '*** 干渉あり — 実行を拒否します ***'}")
     return clear
+
+
+def liftoff_record(stages, detail):
+    """What the lift-off actually was this run, built from what was used.
+
+    Not from a constant: there is no constant any more. The stage list says
+    whether one was planned and how many waypoints it got; the planner's own
+    working says which direction it measured as lifting and what that bought.
+    """
+    stage = next((s for s in stages
+                  if s.kind == "transit" and s.label.startswith("離陸")), None)
+    record = {
+        "liftoff_needed": bool(stage),
+        "liftoff_waypoints": [] if stage is None else
+            [{joint: round(value, 3) for joint, value in point.items()}
+             for point in stage.path],
+        "liftoff_stage_label": None if stage is None else stage.label,
+        "liftoff_selected_joint": None,
+        "liftoff_direction": None,
+        "liftoff_move_deg": None,
+        "liftoff_clearance_before_mm": None,
+        "liftoff_clearance_after_mm": None,
+        "liftoff_speed_deg_s": None if stage is None else stage.speed,
+    }
+    if detail:
+        using = detail.get("using")          # e.g. "elbow_flex -1"
+        if using:
+            joint, _, sign = using.rpartition(" ")
+            record["liftoff_selected_joint"] = joint
+            record["liftoff_direction"] = sign
+        record["liftoff_move_deg"] = detail.get("move_deg")
+        record["liftoff_clearance_before_mm"] = detail.get("start_clearance_mm")
+        record["liftoff_clearance_after_mm"] = detail.get("reaches_mm")
+        record["liftoff_sensitivity_mm_per_deg"] = detail.get(
+            "sensitivity_mm_per_deg")
+        record["liftoff_why_not"] = detail.get("why")
+    return record
 
 
 def git_state():
@@ -1829,7 +1905,6 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
             "wrist_speed_deg_s": WRIST_SPEED_DEG_S,
             "transit_speed_deg_s": TRANSIT_SPEED_DEG_S,
             "liftoff_speed_deg_s": LIFTOFF_SPEED_DEG_S,
-            "liftoff_deg": LIFTOFF_DEG,
             "clearance_floor_mm": CLEARANCE_FLOOR_MM,
             "goal_velocity_ticks_s": goal_velocity,
             "max_relative_target_deg": MAX_RELATIVE_TARGET,
@@ -1837,6 +1912,10 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
         },
         "git": git_state(), "clearance": clearance,
         "support": None if support is None else support.as_dict(),
+        "liftoff": liftoff_record(stages, clearance.get("liftoff")),
+        "stages": [{"label": stage.label, "kind": stage.kind,
+                    "waypoints": len(stage.path), "speed_deg_s": stage.speed,
+                    "subject": stage.subject} for stage in stages],
         "arrivals": [], "holds": [],
     }
 
@@ -1857,32 +1936,31 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
         here = joints_of(robot)
         log("  読み戻し: " + "、".join(f"{n} {here[n]:+.1f}" for n in ARM_JOINTS))
 
-        liftoff, to_posture = stages[0], stages[1]
-
-        log(f"\n  --- {pad('1. ' + liftoff[0], 26)}{len(liftoff[1])} 点、"
-            f"{LIFTOFF_SPEED_DEG_S:.1f} deg/s ---")
-        log("  グリッパは机から 2.9 mm のところに置かれています。ここで動かす")
-        log("  のは、それを持ち上げる elbow_flex と wrist_flex だけです。")
-        log("  shoulder_lift はこの姿勢からではグリッパを下げるので、クリア")
-        log("  ランスが確保できるまで一切指令しません。")
-        if input("  動かすなら ENTER（それ以外は中止）: ").strip():
-            raise KeyboardInterrupt
-        walk(robot, watch, liftoff[1], "liftoff", "elbow_flex",
-             liftoff[1][-1]["elbow_flex"], 0, LIFTOFF_SPEED_DEG_S, log,
-             label=liftoff[0])
-        log(f"    wrist_flex  負荷 {watch.rows[-1]['load']}、"
-            f"{watch.rows[-1]['temperature_c']} C")
-        log("    グリッパは机から離れました。ここから shoulder_lift を使います。")
-        if input("  異常がなければ ENTER で継続（それ以外は中止）: ").strip():
-            raise KeyboardInterrupt
-
-        log(f"\n  --- {pad('2. ' + to_posture[0], 26)}{len(to_posture[1])} 点、"
-            f"{TRANSIT_SPEED_DEG_S:.0f} deg/s ---")
-        if input("  動かすなら ENTER（それ以外は中止）: ").strip():
-            raise KeyboardInterrupt
-        reached = walk(robot, watch, to_posture[1], "transit", "shoulder_lift",
-                       upright["shoulder_lift"], 0, TRANSIT_SPEED_DEG_S, log,
-                       label=to_posture[0])
+        # Every transit stage, in the order the planner produced them. Not
+        # stages[0] and stages[1]: whether there is a lift-off stage at all is
+        # decided per pose now, and indexing past it was how a run with no
+        # lift-off would have flown the wrong stage at the lift-off's speed.
+        transits = [stage for stage in stages if stage.kind == "transit"]
+        reached = None
+        for number, stage in enumerate(transits, 1):
+            log(f"\n  --- {number}/{len(transits)}: {stage.label}、"
+                f"{len(stage.path)} 点、{stage.speed:.1f} deg/s ---")
+            if stage.note:
+                for line in stage.note.split("。"):
+                    if line.strip():
+                        log(f"  {line.strip()}。")
+            if input("  動かすなら ENTER（それ以外は中止）: ").strip():
+                raise KeyboardInterrupt
+            reached = walk(robot, watch, stage.path, stage.kind, stage.subject,
+                           stage.path[-1].get(stage.subject,
+                                              here[stage.subject]),
+                           0, stage.speed, log, label=stage.label)
+            log(f"    {stage.subject}  負荷 {watch.rows[-1]['load']}、"
+                f"{watch.rows[-1]['temperature_c']} C")
+            if number < len(transits):
+                if input("  異常がなければ ENTER で継続（それ以外は中止）: "
+                         ).strip():
+                    raise KeyboardInterrupt
         result["posture_reached_deg"] = {n: round(reached[n], 2)
                                          for n in ARM_JOINTS}
         result["fraction"] = args.fraction
@@ -1896,16 +1974,20 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
                                    "pose": result["posture_reached_deg"]})
 
         if not args.posture_only:
+            # Taken from the list by kind, in pairs: out then back. Counting
+            # from index 2 assumed a lift-off stage was always there in front
+            # of them, and it is not.
+            sweeps = [stage for stage in stages if stage.kind == "sweep"]
             for repeat in range(1, args.repeats + 1):
-                out_stage = stages[2 + 2 * (repeat - 1)]
-                back_stage = stages[3 + 2 * (repeat - 1)]
+                out_stage = sweeps[2 * (repeat - 1)]
+                back_stage = sweeps[2 * (repeat - 1) + 1]
                 log(f"\n  --- {repeat}/{args.repeats} 回目: "
                     f"{SAFE_DEG:+.0f} → {args.to:+.1f} deg、"
-                    f"{len(out_stage[1])} 点 ---")
+                    f"{len(out_stage.path)} 点 ---")
                 if input("  進めるなら ENTER（それ以外は中止）: ").strip():
                     raise KeyboardInterrupt
-                walk(robot, watch, out_stage[1], "approach", JOINT, args.to,
-                     repeat, WRIST_SPEED_DEG_S, log, label=out_stage[0])
+                walk(robot, watch, out_stage.path, "approach", JOINT, args.to,
+                     repeat, out_stage.speed, log, label=out_stage.label)
 
                 taken = hold_at(robot, watch, args.to, args.hold, repeat, log)
                 stats = summarise(taken, f"hold {repeat}")
@@ -1923,8 +2005,9 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
                     f"{stats['temperature_end_c']} C")
 
                 log(f"    {SAFE_DEG:+.0f} deg へ戻します")
-                walk(robot, watch, back_stage[1], "return", JOINT, SAFE_DEG,
-                     repeat, WRIST_SPEED_DEG_S, log, label=back_stage[0])
+                walk(robot, watch, back_stage.path, "return", JOINT,
+                     SAFE_DEG, repeat, back_stage.speed, log,
+                     label=back_stage.label)
 
         result["current_register_ever_nonzero"] = watch.current_ever_nonzero
         if not watch.current_ever_nonzero:
