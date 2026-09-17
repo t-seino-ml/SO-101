@@ -59,6 +59,15 @@ def table_height(model_path=MODEL_PATH):
 
     Using the real figure costs about 6 mm of apparent clearance against the old
     one. That is the right direction to be wrong in.
+
+    This number is fixed by where the arm is bolted, and it is NOT the place to
+    absorb a disagreement between the model and the bench. On 2026-09-17 the
+    model put the gripper 7.5 mm through the table while the gripper was
+    demonstrably not touching it, and the base was confirmed sitting flush. A
+    height that is checked with a ruler cannot be the explanation for that; the
+    explanation is on the arm's side of the problem - collision geometry, a
+    frame, the TCP, a joint zero - and moving this constant would only hide it
+    while leaving every other prediction as wrong as it was.
     """
     global _TABLE_Z
     if _TABLE_Z is None:

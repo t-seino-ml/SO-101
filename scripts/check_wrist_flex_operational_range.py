@@ -540,13 +540,22 @@ def where(port, log):
     lows = {body: table.sim.lowest_point(bodies=(body,))
             for body in MOVING_BODIES}
     body = min(lows, key=lows.get)
+    # The gripper assembly's own lowest point, reported whether or not it is the
+    # lowest thing on the arm. It is the feature a person can actually put a
+    # ruler under, so it is the one worth quoting at every pose - the global
+    # minimum wanders to the shoulder as soon as the wrist comes up, and then
+    # the two numbers stop being about the same thing.
+    jaws_low = min(lows["gripper"], lows["moving_jaw_so101_v1"]) - table.z
     verdict = ("十分です" if 1000 * gap >= CLEARANCE_WANTED_MM else
                "下限は満たします" if 1000 * gap >= CLEARANCE_FLOOR_MM else
                "*** 足りません ***")
     log(f"\n  机までのクリアランス {1000*gap:+.1f} mm   {verdict}")
-    log(f"    最下点は {body}、机面から {1000*gap:+.1f} mm の高さ")
-    log("    これはモデルの予測です。定規で実測した値と一致するとは限りません")
-    log("    — 一致しない分が、そのまま Sim→Real の差です。")
+    log(f"    アーム全体の最下点は {body}")
+    log(f"\n  定規で測るならここ:")
+    log(f"    グリッパ組立（指先）の最下点   モデル予測 机面から "
+        f"{1000*jaws_low:+.1f} mm")
+    log("    これはモデルの予測であって、実測値ではありません。")
+    log("    実測との差が、そのまま Sim→Real の差です。")
     log(f"    下限 {CLEARANCE_FLOOR_MM:.0f} mm / 望ましくは "
         f"{CLEARANCE_WANTED_MM:.0f} mm 以上")
     if contacts:
