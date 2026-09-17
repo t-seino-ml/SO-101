@@ -84,28 +84,42 @@ CAN_PLAN = [
 ]
 
 
-def drive_until_enter(robot, teleop, label, hint, fps=60):
-    """Leader drives follower until ENTER. Returns the follower's pose."""
-    from lerobot.utils.utils import enter_pressed, move_cursor_up
+def drive_until_enter(robot, teleop, label, hint, fps=60, patience=5):
+    """Leader drives follower until ENTER. Returns the follower's pose.
+
+    Nothing is read back while driving, and that is the point. This loop used to
+    print every joint and poll the load and temperature of all six every frame -
+    twelve extra single-register reads at 60 Hz, some seven hundred a second on
+    top of the leader's read and the follower's write. The bus gave out
+    mid-session with "no status packet" and the teaching went with it. The only
+    read that has to happen is the one at ENTER.
+
+    A dropped packet is survivable and a lost session is not, so a bad frame is
+    retried rather than raised: the leader and the follower are on separate USB
+    adapters and either can garble one.
+    """
+    from lerobot.utils.utils import enter_pressed
 
     print(f"\n  === {label} ===")
     print(f"  {hint}")
     print("  リーダで動かし、決まったら ENTER。")
     period = 1.0 / fps
+    misses = 0
     while True:
         started = time.perf_counter()
-        robot.send_action(teleop.get_action())
-        pose = joints_of(robot)
-        load, where, temperature, grip = health(robot)
-        print("    " + "  ".join(f"{n[:5]}{pose[n]:+7.1f}" for n in ARM_JOINTS)
-              + f"  grip{pose.get('gripper', 0):+6.1f}"
-              + f"   腕 {load:>4}({where or '-'})  顎 {grip:>4}  {temperature}C   ",
-              end="", flush=True)
+        try:
+            robot.send_action(teleop.get_action())
+            misses = 0
+        except Exception as error:  # noqa: BLE001 - one bad packet is not a fault
+            misses += 1
+            if misses >= patience:
+                raise
+            print(f"    通信が乱れました（{misses}/{patience}）: "
+                  f"{type(error).__name__}")
+            time.sleep(0.1)
+            continue
         if enter_pressed():
-            print()
-            return pose
-        print()
-        move_cursor_up(1)
+            return joints_of(robot)
         time.sleep(max(0.0, period - (time.perf_counter() - started)))
 
 
