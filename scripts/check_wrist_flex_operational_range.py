@@ -117,28 +117,34 @@ WAYPOINT_TIMEOUT_S = 4.0
 #: Speed the 30 Hz interpolation asks for between waypoints.
 WRIST_SPEED_DEG_S = 8.0
 TRANSIT_SPEED_DEG_S = 5.0
-#: Getting off the table, before anything else moves, and only with the two
-#: joints that lift the gripper.
+#: Getting off the table before anything else moves, with whichever joints
+#: actually lift the gripper from the pose the arm is in.
 #:
-#: The arm is parked with the gripper 2.9 mm above the table - it is resting
-#: there - and the obvious move is wrong. shoulder_lift, the joint that raises
-#: the arm, pushes the gripper *down* from this pose: +10 degrees of it puts the
-#: gripper 13.9 mm below the table. Interpolating every joint together does
-#: clear, but only because elbow_flex and wrist_flex lift faster than
-#: shoulder_lift pushes down, and that cancellation is exactly what fails when a
-#: joint lags. Measured in the twin: hold elbow_flex still and let shoulder_lift
-#: track, and 2% of the way through the transit the gripper is already through
-#: the table. elbow_flex is the joint that lagged on the first attempt.
+#: Which joints those are is not a constant, and assuming it is would be the
+#: same mistake in a new place. From the folded parked pose, shoulder_lift - the
+#: joint that raises the arm - pushes the gripper *down*: +10 degrees of it puts
+#: the gripper 13.9 mm below the table, while elbow_flex and wrist_flex lift it.
+#: Interpolating every joint together does clear, but only because the lifting
+#: pair wins the race, and that cancellation is exactly what fails when a joint
+#: lags. Measured in the twin: hold elbow_flex still, let shoulder_lift track,
+#: and 2% of the way through the transit the gripper is already through the
+#: table. elbow_flex is the joint that lagged on the first attempt.
 #:
-#: So shoulder_lift is not commanded at all until the gripper is clear. These
-#: two are, both of them upwards, and after 2 waypoints the clearance is 18.6 mm.
-LIFTOFF_DEG = {"elbow_flex": -8.0, "wrist_flex": -16.0}
+#: So the direction is measured from wherever the arm is, every run, and the
+#: joints that turn out to lower the gripper are not commanded until it is
+#: clear. These are the candidates and the step the search grows in.
+LIFT_CANDIDATES = ("wrist_flex", "elbow_flex", "shoulder_lift")
+LIFTOFF_STEP_DEG = 4.0
+LIFTOFF_MAX_DEG = 40.0
 LIFTOFF_SPEED_DEG_S = 1.5
-#: Once lifted off, the arm may not come back below this. It is not applied to
-#: the parked pose itself - the arm is already sitting there and no path can
-#: change where it starts - but from the first commanded move onwards the
-#: clearance may only improve.
+#: What the arm must have before it is allowed to move at all, and what it must
+#: keep afterwards. The first live attempt put the gripper on the table; 2.9 mm
+#: of model clearance is not enough to cover CAD error, backlash and sag, so the
+#: run refuses to start below this rather than reporting it and carrying on.
 CLEARANCE_FLOOR_MM = 10.0
+CLEARANCE_WANTED_MM = 15.0
+#: How much of the travel a waypoint must stay inside the servo's own limits by.
+LIMIT_MARGIN_DEG = 2.0
 #: Written into the servos' Goal_Velocity, and restored to 0 afterwards. With
 #: no relative clamp on the commands this is the hardware's own ceiling on how
 #: fast anything can happen, so it matters more than it used to. Left at the
@@ -372,7 +378,218 @@ def waypoints(start, goal, step_deg=STEP_DEG):
             for step in range(1, steps + 1)]
 
 
-def replay(stages, start, jaws_deg, log, fine=6):
+class Table:
+    """The table, and how far the arm is from it. One height, one simulator.
+
+    Built once and passed around rather than re-derived: a clearance figure and
+    a workspace map that disagree about where the table is are not measuring the
+    same thing, and four different heights were in circulation before
+    `so101.sim.table_height()` existed.
+    """
+
+    def __init__(self, jaws_deg):
+        from so101.sim import SO101Sim, table_height
+
+        self.z = table_height()
+        self.jaws = jaws_deg
+        self.sim = SO101Sim(table_z=self.z)
+        self.ignore = tuple(f"block_{i}" for i in range(16)) + \
+            tuple(f"block_{i}_geom" for i in range(16))
+
+    def look(self, pose):
+        """(clearance in metres, self-contacts) for a pose."""
+        # The jaws where they actually are, not where some other script opens
+        # them to: the gripper is the lowest thing here and its own angle moves
+        # it, and this run never commands the gripper at all.
+        self.sim.set_joints(pose, gripper_deg=self.jaws)
+        contacts = {f"{a}/{b}" for a, b, _ in self.sim.collisions(
+            ignore=self.ignore) if "table" not in (a, b)}
+        lowest = min(self.sim.lowest_point(bodies=(body,))
+                     for body in MOVING_BODIES)
+        return lowest - self.z, contacts
+
+    def gap(self, pose):
+        return self.look(pose)[0]
+
+
+def sensitivities(table, start, probe_deg=2.0):
+    """How much each joint raises or lowers the gripper, from where the arm is.
+
+    Measured, not assumed. Which way is up depends on the pose, and the whole
+    reason the gripper reached the table was a path built on an assumption about
+    that which stopped being true.
+    """
+    here = table.gap(start)
+    out = {}
+    for name in LIFT_CANDIDATES:
+        for sign in (+1, -1):
+            pose = dict(start)
+            pose[name] += sign * probe_deg
+            out[(name, sign)] = (table.gap(pose) - here) / probe_deg
+    return out
+
+
+def plan_liftoff(table, start, upright, arm, log):
+    """A first move that only raises the gripper, chosen from where the arm is.
+
+    Returns (goal, detail). `goal` is None when the arm already has the room and
+    the straight path to the posture keeps it - there is no virtue in moving
+    joints for their own sake.
+    """
+    floor = CLEARANCE_FLOOR_MM / 1000
+    here = table.gap(start)
+    detail = {"start_clearance_mm": round(1000 * here, 2),
+              "sensitivity_mm_per_deg": {}}
+
+    rates = sensitivities(table, start)
+    for (name, sign), rate in sorted(rates.items(), key=lambda kv: -kv[1]):
+        detail["sensitivity_mm_per_deg"][f"{name} {sign:+d}"] = round(
+            1000 * rate, 2)
+
+    # Does it need one at all? Only if the straight run to the posture would
+    # take it below the floor.
+    straight = waypoints(start, upright)
+    least = min(min(table.gap(_between(start, point, step))
+                    for step in (0.25, 0.5, 0.75, 1.0))
+                for point in straight)
+    least = min(least, here)
+    detail["straight_min_clearance_mm"] = round(1000 * least, 2)
+    if here >= floor and least >= floor:
+        detail["needed"] = False
+        return None, detail
+    detail["needed"] = True
+
+    # It does. Grow the best lifting direction until there is room, refusing any
+    # candidate that dips on the way or touches something new.
+    best = max(rates, key=lambda key: rates[key])
+    if rates[best] <= 0:
+        detail["why"] = "no joint raises the gripper from this pose"
+        return None, detail
+    detail["using"] = f"{best[0]} {best[1]:+d}"
+
+    limits = (arm[best[0]]["min_deg"] + LIMIT_MARGIN_DEG,
+              arm[best[0]]["max_deg"] - LIMIT_MARGIN_DEG)
+    wanted = max(floor, CLEARANCE_WANTED_MM / 1000)
+    move = 0.0
+    while move < LIFTOFF_MAX_DEG:
+        move += LIFTOFF_STEP_DEG
+        angle = start[best[0]] + best[1] * move
+        if not limits[0] <= angle <= limits[1]:
+            detail["why"] = (f"{best[0]} reaches its limit at "
+                             f"{best[1] * move:+.0f} deg")
+            break
+        goal = {best[0]: angle}
+        path = waypoints(start, goal)
+        gaps = [here] + [table.gap(_between(start, point, step))
+                         for point in path for step in (0.5, 1.0)]
+        contacts = table.look(start)[1]
+        offending = set()
+        for point in path:
+            offending |= table.look({**start, **point})[1] - contacts
+        rising = all(b >= a - 1e-6 for a, b in zip(gaps, gaps[1:]))
+        if offending or not rising:
+            detail["why"] = ("self-collision" if offending
+                             else "the clearance dips on the way")
+            break
+        if gaps[-1] >= wanted:
+            detail["move_deg"] = round(best[1] * move, 1)
+            detail["reaches_mm"] = round(1000 * gaps[-1], 2)
+            return goal, detail
+    detail.setdefault("why", "could not reach the wanted clearance")
+    return None, detail
+
+
+def report_liftoff(detail, liftoff, log):
+    """Why the lift-off is what it is, in the order a person would ask."""
+    log(f"    {pad('開始時のクリアランス', 30)}"
+        f"{detail['start_clearance_mm']:+.1f} mm")
+    log(f"    {pad('そのまま姿勢へ向かった場合の最小', 30)}"
+        f"{detail['straight_min_clearance_mm']:+.1f} mm")
+    log("    各関節が 1 deg あたりグリッパを上下させる量"
+        "（この姿勢で実測。固定値ではありません）:")
+    for name, rate in detail["sensitivity_mm_per_deg"].items():
+        arrow = "↑" if rate > 0.05 else ("↓" if rate < -0.05 else " ")
+        log(f"      {pad(name, 22)}{rate:>+7.2f} mm/deg  {arrow}")
+    if not detail["needed"]:
+        log("    → 離陸区間は不要です。すでに余裕があり、姿勢まで下回りません。")
+        return
+    if liftoff is None:
+        log(f"    → *** 離陸経路を作れませんでした: {detail.get('why')} ***")
+        return
+    log(f"    → {detail['using']} を {detail['move_deg']:+.0f} deg。"
+        f"クリアランスは {detail['reaches_mm']:+.1f} mm になります。")
+    log("      上げる方向の関節だけを使い、下げる方向のものは余裕が"
+        "できるまで指令しません。")
+
+
+def where(port, log):
+    """Read-only: where the arm is and how much room it has. Repeat while lifting."""
+    arm = read_arm(port)
+    start = {name: arm[name]["deg"] for name in ARM_JOINTS}
+    table = Table(arm["gripper"]["deg"])
+    gap, contacts = table.look(start)
+
+    log(f"\n  TABLE_Z {1000*table.z:+.2f} mm（ベース底面）、"
+        f"jaws {arm['gripper']['deg']:+.1f} deg")
+    log("  " + pad("joint", 16) + rpad("現在角", 9) + rpad("ticks", 8)
+        + rpad("限界まで", 12))
+    for name in ARM_JOINTS:
+        j = arm[name]
+        room = min(j["deg"] - j["min_deg"], j["max_deg"] - j["deg"])
+        log(f"  {pad(name, 16)}{j['deg']:>+9.2f}{j['ticks']:>8}{room:>9.1f} deg")
+    verdict = ("十分です" if 1000 * gap >= CLEARANCE_WANTED_MM else
+               "下限は満たします" if 1000 * gap >= CLEARANCE_FLOOR_MM else
+               "*** 足りません ***")
+    log(f"\n  机までのクリアランス {1000*gap:+.1f} mm   {verdict}")
+    log(f"    下限 {CLEARANCE_FLOOR_MM:.0f} mm / 望ましくは "
+        f"{CLEARANCE_WANTED_MM:.0f} mm 以上")
+    if contacts:
+        log(f"    自身に接触しています: {sorted(contacts)}")
+    if 1000 * gap < CLEARANCE_WANTED_MM:
+        log("\n  どちらへ動かせば上がるか（この姿勢で実測）:")
+        rates = sensitivities(table, start)
+        for (name, sign), rate in sorted(rates.items(),
+                                         key=lambda kv: -kv[1])[:3]:
+            log(f"    {pad(f'{name} {sign:+d}', 22)}{1000*rate:>+7.2f} mm/deg")
+    log("")
+    return 1000 * gap
+
+
+def _between(start, point, fraction):
+    """The pose `fraction` of the way from `start` to `point`."""
+    pose = dict(start)
+    pose.update({n: start[n] + (point[n] - start[n]) * fraction for n in point})
+    return pose
+
+
+def check_limits(stages, arm, log):
+    """Is every waypoint inside the servos' own limits? Returns True if so."""
+    worst = {}
+    for label, path in stages:
+        for index, point in enumerate(path, 1):
+            for name, value in point.items():
+                low = arm[name]["min_deg"] + LIMIT_MARGIN_DEG
+                high = arm[name]["max_deg"] - LIMIT_MARGIN_DEG
+                room = min(value - low, high - value)
+                if name not in worst or room < worst[name][0]:
+                    worst[name] = (room, value, label, index)
+    ok = True
+    log("    " + pad("joint", 16) + rpad("最も端に近い waypoint", 24)
+        + rpad("限界まで", 12) + "   stage")
+    for name in ARM_JOINTS:
+        if name not in worst:
+            continue
+        room, value, label, index = worst[name]
+        if room < 0:
+            ok = False
+        log(f"    {pad(name, 16)}{value:>+16.2f} deg{room:>16.2f} deg"
+            f"   {label} #{index}"
+            + ("" if room >= 0 else "   *** 限界外 ***"))
+    log(f"    （ファームウェア限界から {LIMIT_MARGIN_DEG:.1f} deg 内側を要求）")
+    return ok
+
+
+def replay(stages, start, table, log, fine=6):
     """Fly the exact waypoint list in MuJoCo. Returns (clear, report).
 
     `fine` subdivides each waypoint interval further, because a collision can
@@ -381,53 +598,41 @@ def replay(stages, start, jaws_deg, log, fine=6):
     Three things are checked and they fail differently.
 
     A contact that is *new* compared with where the arm already rests is one the
-    path created; the contacts the parked pose already has are the arm leaning
-    on itself as it sits there, and it leaves them on the first move.
+    path created; the contacts the start pose already has are the arm leaning on
+    itself as it sits there, and it leaves them on the first move.
 
-    Clearance to the table is judged against where the arm *starts*, not against
-    an absolute floor for every pose. It is parked 2.9 mm off the table, and no
-    path can change where it begins - what a path can do is make that worse, and
-    that is the thing worth refusing.
+    Clearance is judged against the floor everywhere, and additionally against
+    the start: no path can change where the arm begins, and the run refuses to
+    begin below the floor at all. What a path can still do is make it worse.
 
-    And after the lift-off stage, the floor does apply: nothing should come back
-    down.
+    And during the first stage the property that matters is not a threshold but
+    a direction: leaving the table, the clearance may only increase.
     """
-    from so101.sim import SO101Sim, table_height
-
-    table_z = table_height()
-    ignore = tuple(f"block_{i}" for i in range(16)) + \
-        tuple(f"block_{i}_geom" for i in range(16))
-    sim = SO101Sim(table_z=table_z)
-
     def look(pose):
-        # The jaws where they actually are, not where some other script opens
-        # them to: the gripper is the lowest thing here and its own angle moves
-        # it. This run never commands the gripper at all.
-        sim.set_joints(pose, gripper_deg=jaws_deg)
-        found = {f"{a}/{b}" for a, b, _ in sim.collisions(ignore=ignore)
-                 if "table" not in (a, b)}
-        lowest = min(sim.lowest_point(bodies=(body,))
-                     for body in MOVING_BODIES)
-        return found, lowest - table_z
+        gap, contacts = table.look(pose)
+        return contacts, gap
 
     here = dict(start)
     baseline, parked = look(here)
+    table_z = table.z
     log(f"    TABLE_Z        {1000*table_z:+.2f} mm（ベース底面。so101.sim."
         f"table_height()）")
-    log(f"    MIN_CLEARANCE  {CLEARANCE_FLOOR_MM:.1f} mm（離陸後に守る下限）")
-    log(f"    駐機時のクリアランス {1000*parked:+.1f} mm"
-        f"（いま置かれている姿勢。経路では変えられません）")
+    log(f"    MIN_CLEARANCE  {CLEARANCE_FLOOR_MM:.1f} mm"
+        f"（開始時にも、離陸後にも守る下限）")
+    log(f"    開始時のクリアランス {1000*parked:+.1f} mm"
+        f"{'' if parked >= CLEARANCE_FLOOR_MM / 1000 else '  *** 不足 ***'}")
     if baseline:
-        log(f"    いまの休止姿勢はすでに自身に接触しています: {sorted(baseline)}")
-        log("    （折り畳まれて寄りかかっている状態です。動き出せば離れます）")
+        log(f"    この姿勢はすでに自身に接触しています: {sorted(baseline)}")
     log("")
     log("    " + pad("stage", 30) + rpad("点", 5) + rpad("最小クリアランス", 18)
         + "   判定")
 
-    clear = True
+    clear = parked >= CLEARANCE_FLOOR_MM / 1000
     report = {"table_z_mm": round(1000 * table_z, 3),
               "clearance_floor_mm": CLEARANCE_FLOOR_MM,
-              "parked_clearance_mm": round(1000 * parked, 2), "stages": []}
+              "clearance_wanted_mm": CLEARANCE_WANTED_MM,
+              "start_clearance_mm": round(1000 * parked, 2),
+              "start_ok": bool(clear), "stages": []}
     lifted_off = False
     for label, path in stages:
         least, offenders, worst_at = float("inf"), set(), None
@@ -455,7 +660,8 @@ def replay(stages, start, jaws_deg, log, fine=6):
 
         # Before the lift-off has finished, the arm is allowed to be as close as
         # it was parked and no closer. After it, the floor applies.
-        allowed = CLEARANCE_FLOOR_MM / 1000 if lifted_off else parked
+        allowed = CLEARANCE_FLOOR_MM / 1000 if lifted_off else min(
+            parked, CLEARANCE_FLOOR_MM / 1000)
         ok = not offenders and least >= allowed - 1e-9 and dipped_at is None
         note = "" if not rising else ("、単調に増加" if dipped_at is None
                                       else "、*** 途中で下がります ***")
@@ -491,21 +697,23 @@ def replay(stages, start, jaws_deg, log, fine=6):
 
 
 def stages_for(start, posture, target_deg, repeats, posture_only,
-               posture_name="upright"):
+               posture_name="upright", liftoff=None):
     """Every move the run will make, named, as waypoint lists.
 
     One function, used by the twin and by the arm. When the two disagree about
     what is going to be flown, the twin's verdict is about something else.
 
-    The first stage only ever lifts. See LIFTOFF_DEG for why that is not the
-    same as the first slice of a straight line to the posture.
+    `liftoff` comes from `plan_liftoff`, measured from this start pose. It is
+    None when the arm already has the room, and there is no virtue in moving
+    joints for their own sake.
     """
     upright = dict(posture, wrist_flex=SAFE_DEG)
-    liftoff = {name: start[name] + move for name, move in LIFTOFF_DEG.items()}
+    out = []
     lifted = dict(start)
-    lifted.update(liftoff)
-    out = [("離陸（机から離す）", waypoints(start, liftoff)),
-           (f"{posture_name} へ", waypoints(lifted, upright))]
+    if liftoff:
+        out.append(("離陸（机から離す）", waypoints(start, liftoff)))
+        lifted.update(liftoff)
+    out.append((f"{posture_name} へ", waypoints(lifted, upright)))
     if posture_only:
         return out
     here = dict(upright)
@@ -937,9 +1145,10 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
     log(f"    {pad('TABLE_Z', 28)}{clearance['table_z_mm']:+.2f} mm"
         f"（ベース底面。so101.sim.table_height() ただ一箇所から）")
     log(f"    {pad('MIN_CLEARANCE', 28)}{clearance['clearance_floor_mm']:.1f} mm"
-        f"（離陸後に守る下限）")
-    log(f"    {pad('駐機時', 28)}{clearance['parked_clearance_mm']:+.1f} mm"
-        f"（いま置かれている姿勢。経路では変えられません）")
+        f"（開始時にも、離陸後にも守る下限。"
+        f"望ましくは {clearance['clearance_wanted_mm']:.0f} mm 以上）")
+    log(f"    {pad('開始時', 28)}{clearance['start_clearance_mm']:+.1f} mm"
+        f"   {'OK' if clearance['start_ok'] else '*** 不足 — 実行を拒否します ***'}")
     log(f"    {pad('経路全体の最小', 28)}{clearance['min_clearance_mm']:+.1f} mm")
     for stage in clearance["stages"]:
         log(f"      {pad(stage['stage'], 28)}"
@@ -1016,6 +1225,9 @@ def main():
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
     parser.add_argument("--posture-only", action="store_true",
                         help="姿勢へ行って到達を確認し、戻るだけ。手首は振りません")
+    parser.add_argument("--where", action="store_true",
+                        help="いまの姿勢と机までの余裕を表示するだけ。"
+                             "手でアームを持ち上げながら繰り返し実行できます")
     parser.add_argument("--dry-run", action="store_true",
                         help="計画を表示するだけで、何も動かしません")
     parser.add_argument("--posture", choices=sorted(POSTURES), default="upright",
@@ -1028,6 +1240,10 @@ def main():
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
+    if args.where:
+        from so101.hardware import resolve as resolve_port
+        where(resolve_port([args.follower_port])[0], Log())
+        return
     if args.posture_only:
         args.to = 0.0
     elif args.to is None:
@@ -1061,17 +1277,43 @@ def main():
         arm = read_arm(port)
         posture = POSTURES[args.posture]
         start = {name: arm[name]["deg"] for name in ARM_JOINTS}
+        table = Table(arm["gripper"]["deg"])
+
+        log("\n  --- ここから机までの余裕を、いまの姿勢について測ります ---")
+        liftoff, detail = plan_liftoff(table, start, dict(posture,
+                                                          wrist_flex=SAFE_DEG),
+                                       arm, log)
+        report_liftoff(detail, liftoff, log)
+
         stages = stages_for(start, posture, args.to, args.repeats,
-                            args.posture_only, args.posture)
+                            args.posture_only, args.posture, liftoff)
 
         log("\n  --- 送信する waypoint 列を、そのまま MuJoCo で再生します ---")
-        clear, clearance = replay(stages, start, arm["gripper"]["deg"], log)
+        clear, clearance = replay(stages, start, table, log)
+        clearance["liftoff"] = detail
+
+        log("\n  --- 全 waypoint が現在の joint limit の内側か ---")
+        limits_ok = check_limits(stages, arm, log)
 
         ok = plan_report(args, arm, posture, stages, out_dir, lock_path, log,
-                         clear, clearance)
+                         clear and limits_ok, clearance)
         if args.dry_run:
             log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
+        if not limits_ok:
+            raise SystemExit(
+                "\n  joint limit の外へ出る waypoint があります。実行を拒否します。\n")
+        if clearance["start_clearance_mm"] < CLEARANCE_FLOOR_MM:
+            raise SystemExit(
+                f"\n  開始時のクリアランスが "
+                f"{clearance['start_clearance_mm']:.1f} mm しかありません"
+                f"（下限 {CLEARANCE_FLOOR_MM:.0f} mm、"
+                f"望ましくは {CLEARANCE_WANTED_MM:.0f} mm 以上）。\n"
+                "  トルクは切れています。アームを手でゆっくり持ち、グリッパを\n"
+                "  机から離す方向へ少し持ち上げてください。関節を無理に回したり\n"
+                "  ストップ方向へ押したりはしないでください。\n"
+                "  持ち上げながら、別のターミナルでこれを繰り返せば今の値が出ます:\n"
+                "    uv run scripts/check_wrist_flex_operational_range.py --where\n")
         if not ok:
             raise SystemExit(
                 "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
