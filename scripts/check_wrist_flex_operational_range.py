@@ -143,6 +143,28 @@ LIFTOFF_SPEED_DEG_S = 1.5
 #: run refuses to start below this rather than reporting it and carrying on.
 CLEARANCE_FLOOR_MM = 10.0
 CLEARANCE_WANTED_MM = 15.0
+#: What a *measured* start clearance must be, when one is given. Higher than the
+#: modelled floor on purpose: a ruler read to the nearest centimetre is worth
+#: about +-5 mm, and a start condition should not be one measurement error away
+#: from being false.
+MEASURED_FLOOR_MM = 30.0
+
+#: Test A's headline criterion, and the one that survives what is known about
+#: the model.
+#:
+#: The model's absolute clearance figures are wrong. Measured against a ruler on
+#: 2026-09-17: 17.6 mm out at the parked pose, 45.3 mm out with the arm held up,
+#: both in the conservative direction - and two poses do not make "conservative"
+#: a property of every pose, only of those two. So an absolute threshold from
+#: this model is a number whose error is unknown at the poses in between.
+#:
+#: What survives is the direction. Whatever the model's offset turns out to be,
+#: the arm should not be getting closer to the table than it started, and a
+#: first-order geometric fact like which way a link is moving is far more robust
+#: to an offset than the height it is moving at. So this is checked over every
+#: pose of the path, on the gripper and on the arm as a whole, and it is what
+#: Test A is really asking.
+APPROACH_TOLERANCE_MM = 1.0
 #: How much of the travel a waypoint must stay inside the servo's own limits by.
 LIMIT_MARGIN_DEG = 2.0
 #: Written into the servos' Goal_Velocity, and restored to 0 afterwards. With
@@ -396,6 +418,18 @@ class Table:
         self.ignore = tuple(f"block_{i}" for i in range(16)) + \
             tuple(f"block_{i}_geom" for i in range(16))
 
+    def gripper_gap(self, pose):
+        """The gripper assembly's own clearance, whether or not it is lowest.
+
+        Tracked separately because the global minimum moves to the shoulder - a
+        fixed body that never gets any closer - as soon as the wrist comes up,
+        and after that the global figure stops saying anything about the part
+        that can actually hit the table.
+        """
+        self.sim.set_joints(pose, gripper_deg=self.jaws)
+        return min(self.sim.lowest_point(bodies=(body,))
+                   for body in ("gripper", "moving_jaw_so101_v1")) - self.z
+
     def look(self, pose):
         """(clearance in metres, self-contacts) for a pose."""
         # The jaws where they actually are, not where some other script opens
@@ -577,6 +611,48 @@ def _between(start, point, fraction):
     return pose
 
 
+def check_path_shape(stages, start, log):
+    """Does the waypoint list step smoothly, or does it jump between branches?
+
+    Nothing here solves inverse kinematics, so a configuration flip cannot
+    happen by construction - the waypoints are a straight line in joint space.
+    That is a claim worth checking rather than asserting: it is exactly the
+    property that would be lost if anything later planned these poses instead
+    of interpolating them, and the check costs nothing.
+
+    A jump would show as a step larger than the spacing, or as a joint that
+    reverses direction partway through a stage.
+    """
+    ok = True
+    log("    " + pad("stage", 30) + rpad("最大の 1 歩", 14)
+        + rpad("向きの反転", 12) + "   判定")
+    for label, path in stages:
+        biggest, reversals, where = 0.0, 0, ""
+        previous = dict(start)
+        directions = {}
+        for point in path:
+            for name, value in point.items():
+                step = value - previous[name]
+                if abs(step) > biggest:
+                    biggest, where = abs(step), name
+                if abs(step) > 1e-6:
+                    sign = 1 if step > 0 else -1
+                    if directions.get(name, sign) != sign:
+                        reversals += 1
+                    directions[name] = sign
+            previous = dict(previous)
+            previous.update(point)
+        start = dict(previous)
+        good = biggest <= STEP_DEG * 1.05 + 1e-6 and reversals == 0
+        ok = ok and good
+        log(f"    {pad(label, 30)}{biggest:>9.2f} deg"
+            f"{f' ({where})' if where else '':<12}{reversals:>4}"
+            f"       {'滑らか' if good else '*** 不連続 ***'}")
+    log(f"    （1 歩の上限 {STEP_DEG:.1f} deg、関節空間の直線補間なので"
+        f"反転は 0 のはずです）")
+    return ok
+
+
 def check_limits(stages, arm, log):
     """Is every waypoint inside the servos' own limits? Returns True if so."""
     worst = {}
@@ -639,23 +715,22 @@ def replay(stages, start, table, log, fine=6):
     if baseline:
         log(f"    この姿勢はすでに自身に接触しています: {sorted(baseline)}")
     log("")
-    log("    " + pad("stage", 30) + rpad("点", 5) + rpad("最小クリアランス", 18)
-        + "   判定")
+    log("    " + pad("stage", 30) + rpad("点", 5) + rpad("最小 全体", 13)
+        + rpad("グリッパ", 13) + "   判定")
 
-    clear = parked >= CLEARANCE_FLOOR_MM / 1000
+    start_grip = table.gripper_gap(start)
+    tolerance = APPROACH_TOLERANCE_MM / 1000
+    clear = True
     report = {"table_z_mm": round(1000 * table_z, 3),
               "clearance_floor_mm": CLEARANCE_FLOOR_MM,
               "clearance_wanted_mm": CLEARANCE_WANTED_MM,
+              "approach_tolerance_mm": APPROACH_TOLERANCE_MM,
               "start_clearance_mm": round(1000 * parked, 2),
-              "start_ok": bool(clear), "stages": []}
-    lifted_off = False
+              "start_gripper_clearance_mm": round(1000 * start_grip, 2),
+              "stages": []}
     for label, path in stages:
-        least, offenders, worst_at = float("inf"), set(), None
-        # The lift-off's real guarantee is not a number, it is a direction: from
-        # a pose 2.9 mm off the table, the clearance may only increase. No path
-        # can better where the arm starts; what it must not do is go the other
-        # way, which is what shoulder_lift would do from here.
-        rising, previous_gap, dipped_at = not lifted_off, parked, None
+        least, least_grip = float("inf"), float("inf")
+        offenders, worst_at, closed_at = set(), None, None
         previous = dict(here)
         for target in path:
             for step in range(1, fine + 1):
@@ -663,51 +738,54 @@ def replay(stages, start, table, log, fine=6):
                 pose.update({n: previous[n] + (target[n] - previous[n])
                              * step / fine for n in target})
                 found, gap = look(pose)
+                grip = table.gripper_gap(pose)
                 if gap < least:
                     least, worst_at = gap, dict(pose)
-                if rising and gap < previous_gap - 1e-6 and dipped_at is None:
-                    dipped_at = (dict(pose), previous_gap, gap)
-                previous_gap = gap
+                if grip < least_grip:
+                    least_grip = grip
+                # Getting closer to the table than the arm started is the fault
+                # this run is really looking for, and it is asked of the gripper
+                # as well as of the arm as a whole.
+                if closed_at is None and (gap < parked - tolerance
+                                          or grip < start_grip - tolerance):
+                    closed_at = (dict(pose), gap, grip)
                 offenders |= (found - baseline)
             previous = dict(previous)
             previous.update(target)
             here.update(target)
 
-        # Before the lift-off has finished, the arm is allowed to be as close as
-        # it was parked and no closer. After it, the floor applies.
-        allowed = CLEARANCE_FLOOR_MM / 1000 if lifted_off else min(
-            parked, CLEARANCE_FLOOR_MM / 1000)
-        ok = not offenders and least >= allowed - 1e-9 and dipped_at is None
-        note = "" if not rising else ("、単調に増加" if dipped_at is None
-                                      else "、*** 途中で下がります ***")
-        log(f"    {pad(label, 30)}{len(path):>5}{1000*least:>15.1f} mm"
-            f"   {'問題なし' if ok else '*** 不可 ***'}{note}")
+        ok = not offenders and closed_at is None
+        log(f"    {pad(label, 30)}{len(path):>5}{1000*least:>13.1f}"
+            f"{1000*least_grip:>13.1f}   "
+            f"{'机へ近づきません' if ok else '*** 不可 ***'}")
         report["stages"].append({
             "stage": label, "waypoints": len(path),
             "min_clearance_mm": round(1000 * least, 2),
-            "required_mm": round(1000 * allowed, 2),
-            "monotonic": None if not rising else dipped_at is None,
-            "ok": bool(ok)})
+            "min_gripper_clearance_mm": round(1000 * least_grip, 2),
+            "never_approaches": closed_at is None,
+            "no_new_contacts": not offenders, "ok": bool(ok)})
         if offenders:
             log(f"      新たな自己干渉: {sorted(offenders)}")
             clear = False
-        if least < allowed - 1e-9:
-            log(f"      クリアランスが {1000*allowed:.1f} mm を下回ります。"
-                f"そのときの姿勢:")
-            log("        " + "、".join(f"{n} {worst_at[n]:+.1f}"
-                                        for n in ARM_JOINTS))
-            clear = False
-        if dipped_at is not None:
-            pose, before, after = dipped_at
-            log(f"      離陸中にクリアランスが下がります "
-                f"({1000*before:+.1f} → {1000*after:+.1f} mm)。そのときの姿勢:")
+        if closed_at is not None:
+            pose, gap, grip = closed_at
+            log(f"      机へ近づきます: 全体 {1000*parked:+.1f} → "
+                f"{1000*gap:+.1f} mm、グリッパ {1000*start_grip:+.1f} → "
+                f"{1000*grip:+.1f} mm。そのときの姿勢:")
             log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
             clear = False
-        lifted_off = True
 
-    report["min_clearance_mm"] = round(
-        1000 * min(s["min_clearance_mm"] for s in report["stages"]) / 1000, 2)
-    log(f"\n    経路全体の最小クリアランス {report['min_clearance_mm']:+.1f} mm")
+    report["min_clearance_mm"] = min(s["min_clearance_mm"]
+                                     for s in report["stages"])
+    report["min_gripper_clearance_mm"] = min(s["min_gripper_clearance_mm"]
+                                             for s in report["stages"])
+    report["never_approaches"] = all(s["never_approaches"]
+                                     for s in report["stages"])
+    log(f"\n    経路全体の最小   全体 {report['min_clearance_mm']:+.1f} mm、"
+        f"グリッパ {report['min_gripper_clearance_mm']:+.1f} mm")
+    log(f"    開始時からの悪化   "
+        + ("なし（どの姿勢でも机へ近づきません）"
+           if report["never_approaches"] else "*** あり ***"))
     return clear, report
 
 
@@ -1162,16 +1240,32 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
     log(f"    {pad('MIN_CLEARANCE', 28)}{clearance['clearance_floor_mm']:.1f} mm"
         f"（開始時にも、離陸後にも守る下限。"
         f"望ましくは {clearance['clearance_wanted_mm']:.0f} mm 以上）")
-    log(f"    {pad('開始時', 28)}{clearance['start_clearance_mm']:+.1f} mm"
-        f"   {'OK' if clearance['start_ok'] else '*** 不足 — 実行を拒否します ***'}")
-    log(f"    {pad('経路全体の最小', 28)}{clearance['min_clearance_mm']:+.1f} mm")
+    measured = clearance.get("measured_clearance_mm")
+    log(f"    {pad('開始時（モデル予測）', 28)}"
+        f"{clearance['start_clearance_mm']:+.1f} mm"
+        f"（グリッパ {clearance['start_gripper_clearance_mm']:+.1f} mm）")
+    if measured is None:
+        log(f"    {pad('開始時（実測）', 28)}指定なし。モデルの値で判定します")
+    else:
+        log(f"    {pad('開始時（実測・定規）', 28)}{measured:+.1f} mm"
+            f"   下限 {clearance['measured_floor_mm']:.0f} mm   "
+            f"{'OK' if clearance.get('start_ok') else '*** 不足 ***'}")
+        log("      実測は開始条件の判定にだけ使います。ツインの干渉判定と")
+        log("      「机へ近づかない」判定は、この値と無関係に効いています。")
+    log(f"    {pad('経路全体の最小', 28)}"
+        f"全体 {clearance['min_clearance_mm']:+.1f} mm、"
+        f"グリッパ {clearance['min_gripper_clearance_mm']:+.1f} mm")
+    log(f"    {pad('机へ近づくか', 28)}"
+        + ("どの姿勢でも近づきません" if clearance["never_approaches"]
+           else "*** 近づきます — 実行を拒否します ***")
+        + f"（許容 {clearance['approach_tolerance_mm']:.1f} mm）")
     for stage in clearance["stages"]:
         log(f"      {pad(stage['stage'], 28)}"
-            f"{stage['min_clearance_mm']:>7.1f} mm  "
-            f"（要求 {stage['required_mm']:.1f} mm）"
+            f"{stage['min_clearance_mm']:>7.1f}{stage['min_gripper_clearance_mm']:>9.1f} mm"
             f"  {'OK' if stage['ok'] else '*** 不可 ***'}")
-    log("    古い data/table_frame.json の -8.5 mm は使っていません。あれは")
-    log("    机面ではなく、ブロックを咥えたときの gripper frame の高さです。")
+    log("    モデルの絶対値は実測と 17.6 / 45.3 mm ずれていました（2 姿勢で測定）。")
+    log("    どちらも保守側でしたが、2 点では全姿勢がそうだとは言えません。")
+    log("    だから判定は絶対値ではなく「開始時より机へ近づかないこと」です。")
 
     log("\n  --- 走行を止める条件 ---")
     log("    [移動中]")
@@ -1240,6 +1334,10 @@ def main():
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
     parser.add_argument("--posture-only", action="store_true",
                         help="姿勢へ行って到達を確認し、戻るだけ。手首は振りません")
+    parser.add_argument("--measured-clearance", type=float, metavar="MM",
+                        help="定規で実測した、グリッパ最下点から机までの mm。"
+                             "開始条件の判定にだけ使います。モデルの干渉判定を"
+                             "無効化するものではありません")
     parser.add_argument("--where", action="store_true",
                         help="いまの姿勢と机までの余裕を表示するだけ。"
                              "手でアームを持ち上げながら繰り返し実行できます")
@@ -1307,28 +1405,57 @@ def main():
         clear, clearance = replay(stages, start, table, log)
         clearance["liftoff"] = detail
 
+        log("\n  --- waypoint 列の連続性（不自然な branch jump がないか）---")
+        shape_ok = check_path_shape(stages, start, log)
+
         log("\n  --- 全 waypoint が現在の joint limit の内側か ---")
         limits_ok = check_limits(stages, arm, log)
 
+        # The start condition, and the one place a ruler is allowed to speak.
+        # It never switches off the twin: the collision and approach checks
+        # above have already run and their verdict stands whatever is typed
+        # here. What a measurement can settle is only whether the arm is far
+        # enough from the table to begin, which is a fact about the bench that
+        # the model has been shown to get wrong by tens of millimetres.
+        measured = args.measured_clearance
+        clearance["measured_clearance_mm"] = measured
+        clearance["measured_floor_mm"] = MEASURED_FLOOR_MM
+        if measured is None:
+            start_ok = clearance["start_clearance_mm"] >= CLEARANCE_FLOOR_MM
+            clearance["start_basis"] = "model"
+        else:
+            start_ok = measured >= MEASURED_FLOOR_MM
+            clearance["start_basis"] = "measured"
+        clearance["start_ok"] = bool(start_ok)
+
         ok = plan_report(args, arm, posture, stages, out_dir, lock_path, log,
-                         clear and limits_ok, clearance)
+                         clear and limits_ok and shape_ok, clearance)
         if args.dry_run:
             log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
+        if not shape_ok:
+            raise SystemExit(
+                "\n  waypoint 列が不連続です。実行を拒否します。\n")
         if not limits_ok:
             raise SystemExit(
                 "\n  joint limit の外へ出る waypoint があります。実行を拒否します。\n")
-        if clearance["start_clearance_mm"] < CLEARANCE_FLOOR_MM:
+        if not start_ok:
+            if measured is None:
+                raise SystemExit(
+                    f"\n  開始時のクリアランス（モデル）が "
+                    f"{clearance['start_clearance_mm']:.1f} mm しかありません"
+                    f"（下限 {CLEARANCE_FLOOR_MM:.0f} mm）。\n"
+                    "  トルクは切れています。人が手を離しても保つ支持を使って\n"
+                    "  グリッパを机から離し、定規で測った値を渡してください:\n"
+                    "    --measured-clearance <mm>   "
+                    f"（{MEASURED_FLOOR_MM:.0f} mm 以上が必要）\n"
+                    "  いまの姿勢と予測値:\n"
+                    "    uv run scripts/check_wrist_flex_operational_range.py --where\n")
             raise SystemExit(
-                f"\n  開始時のクリアランスが "
-                f"{clearance['start_clearance_mm']:.1f} mm しかありません"
-                f"（下限 {CLEARANCE_FLOOR_MM:.0f} mm、"
-                f"望ましくは {CLEARANCE_WANTED_MM:.0f} mm 以上）。\n"
-                "  トルクは切れています。アームを手でゆっくり持ち、グリッパを\n"
-                "  机から離す方向へ少し持ち上げてください。関節を無理に回したり\n"
-                "  ストップ方向へ押したりはしないでください。\n"
-                "  持ち上げながら、別のターミナルでこれを繰り返せば今の値が出ます:\n"
-                "    uv run scripts/check_wrist_flex_operational_range.py --where\n")
+                f"\n  実測クリアランス {measured:.1f} mm は下限 "
+                f"{MEASURED_FLOOR_MM:.0f} mm に届きません。\n"
+                "  定規の読みは cm 単位で +-5 mm 程度あるので、開始条件が\n"
+                "  測定誤差ひとつでひっくり返らない値にしてあります。\n")
         if not ok:
             raise SystemExit(
                 "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
