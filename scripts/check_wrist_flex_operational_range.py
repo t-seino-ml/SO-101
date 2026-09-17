@@ -42,10 +42,23 @@ import csv  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import subprocess  # noqa: E402
+import sys  # noqa: E402
 import time  # noqa: E402
 from contextlib import contextmanager  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
+
+# The operator-facing text is Japanese. Windows writes console output through
+# WriteConsoleW, so that prints correctly in a terminal whatever the code page
+# is - but redirected to a file or a pipe it falls back to the locale encoding,
+# which here is cp932 and cannot carry every character used below. Ask for
+# UTF-8, and settle for a replacement character rather than an exception raised
+# in the middle of a run that is holding a raised arm.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # not a text stream, or already fixed
+        pass
 
 JOINT = "wrist_flex"
 ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex",
@@ -116,6 +129,30 @@ DEFAULT_OUT = Path("outputs/real/r1_wrist_flex")
 
 class Abort(RuntimeError):
     """Something crossed a threshold. The run stops; the arm keeps holding."""
+
+
+def cells(text):
+    """How many terminal columns `text` occupies.
+
+    The operator-facing text is Japanese and the numbers beside it are not. A
+    kana or kanji occupies two columns where an ASCII letter occupies one, so
+    f-string padding - which counts characters - tears the table apart exactly
+    where someone is trying to read a load figure in a hurry.
+    """
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in text)
+
+
+def pad(text, columns):
+    """Left-align `text` in `columns` terminal columns."""
+    return text + " " * max(0, columns - cells(text))
+
+
+def rpad(text, columns):
+    """Right-align `text` in `columns` terminal columns."""
+    return " " * max(0, columns - cells(text)) + text
 
 
 # -------------------------------------------------------------------------
@@ -284,17 +321,15 @@ def sim_check(start_deg, posture, target_deg, log):
     start = {name: start_deg[name] for name in ARM_JOINTS}
     baseline, _ = contacts(start)
     if baseline:
-        log(f"    the parked pose is already touching itself: "
-            f"{sorted(baseline)}")
-        log(f"    (that is the arm resting folded; it leaves that on the first "
-            f"move)")
+        log(f"    いまの休止姿勢はすでに自身に接触しています: {sorted(baseline)}")
+        log("    （折り畳まれて寄りかかっている状態です。動き出せば離れます）")
 
     stages = []
     goal = dict(posture, wrist_flex=SAFE_DEG)
-    stages.append(("transit to the posture", [
+    stages.append(("姿勢への移動", [
         {n: start[n] + (goal[n] - start[n]) * s / 60 for n in ARM_JOINTS}
         for s in range(61)]))
-    stages.append((f"wrist_flex {SAFE_DEG:+.0f} -> {target_deg:+.0f}", [
+    stages.append((f"wrist_flex {SAFE_DEG:+.0f} → {target_deg:+.0f}", [
         dict(goal, wrist_flex=SAFE_DEG + (target_deg - SAFE_DEG) * s / 60)
         for s in range(61)]))
 
@@ -305,13 +340,14 @@ def sim_check(start_deg, posture, target_deg, log):
             found, low = contacts(pose)
             lowest = min(lowest, low)
             offenders |= (found - baseline)
-        verdict = "clear" if not offenders and lowest > table_z else "NOT CLEAR"
-        log(f"    {label:<34} lowest {1000*lowest:+7.1f} mm   {verdict}")
+        verdict = ("問題なし" if not offenders and lowest > table_z
+                   else "*** 干渉あり ***")
+        log(f"    {pad(label, 28)}最低点 {1000*lowest:+7.1f} mm   {verdict}")
         if offenders:
-            log(f"      new self-collisions: {sorted(offenders)}")
+            log(f"      新たな自己干渉: {sorted(offenders)}")
             clear = False
         if lowest <= table_z:
-            log(f"      reaches the table at {1000*table_z:+.1f} mm")
+            log(f"      机（{1000*table_z:+.1f} mm）に達します")
             clear = False
     return clear
 
@@ -521,96 +557,92 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
     unfold_s, rest_s = transit_times(biggest)
     wrist_s = max(3.0, abs(target - SAFE_DEG) / WRIST_SPEED_DEG_S)
 
-    log("\n  --- where the arm is now (read-only, torque untouched) ---")
-    log(f"    {'joint':<15}{'deg':>9}{'ticks':>8}{'travel, deg':>20}"
-        f"{'torque':>8}{'temp':>7}")
+    log("\n  --- いまアームがいる場所（読み取りのみ。トルクには触れていません）---")
+    log("    " + pad("joint", 15) + rpad("現在角", 9) + rpad("ticks", 8)
+        + rpad("可動範囲 deg", 20) + rpad("torque", 8) + rpad("温度", 7))
     for name in ARM_JOINTS + ("gripper",):
         j = arm[name]
         travel = f"{j['min_deg']:+.2f} .. {j['max_deg']:+.2f}"
         log(f"    {name:<15}{j['deg']:>+9.2f}{j['ticks']:>8}{travel:>20}"
             f"{j['torque']:>8}{j['temperature']:>6}C")
 
-    log(f"\n  --- the posture the sweep happens in: {args.posture} ---")
-    log(f"    {'joint':<15}{'now':>9}{'goal':>9}{'movement':>11}")
+    log(f"\n  --- 掃引を行う姿勢: {args.posture} ---")
+    log("    " + pad("joint", 15) + rpad("現在", 9) + rpad("目標", 9)
+        + rpad("移動量", 11))
     for name in ARM_JOINTS:
-        goal = posture.get(name, SAFE_DEG if name == JOINT else None)
-        if name == JOINT:
-            goal = SAFE_DEG
+        goal = SAFE_DEG if name == JOINT else posture[name]
         log(f"    {name:<15}{arm[name]['deg']:>+9.2f}{goal:>+9.2f}"
             f"{goal - arm[name]['deg']:>+11.2f}")
-    log(f"    largest single joint movement {biggest:+.2f} deg")
+    log(f"    単一関節の最大移動量 {biggest:+.2f} deg")
 
-    log(f"\n  --- wrist_flex target ---")
-    log(f"    target                        {target:+.2f} deg   "
-        f"({ticks:.0f} ticks)")
-    log(f"    firmware Min_Position_Limit   {wrist['min_deg']:+.2f} deg   "
-        f"({wrist['min_ticks']} ticks)   margin {to_min:+.2f} deg")
-    log(f"    firmware Max_Position_Limit   {wrist['max_deg']:+.2f} deg   "
-        f"({wrist['max_ticks']} ticks)   margin {to_max:+.2f} deg")
-    log(f"    R1 ceiling                    {operational:+.2f} deg   "
-        f"margin {operational - abs(target):+.2f} deg")
-    log(f"    planner operational limit     "
-        f"{wrist['max_deg'] - 5.0:+.2f} deg (travel minus the 5 deg safety "
-        f"margin) - not written by this script")
+    log("\n  --- wrist_flex の目標 ---")
+    log(f"    {pad('目標角', 28)}{target:+.2f} deg   ({ticks:.0f} ticks)")
+    log(f"    {pad('ファームウェア下限', 28)}{wrist['min_deg']:+.2f} deg   "
+        f"({wrist['min_ticks']} ticks)   余裕 {to_min:+.2f} deg")
+    log(f"    {pad('ファームウェア上限', 28)}{wrist['max_deg']:+.2f} deg   "
+        f"({wrist['max_ticks']} ticks)   余裕 {to_max:+.2f} deg")
+    log(f"    {pad('R1 の上限', 28)}{operational:+.2f} deg   "
+        f"余裕 {operational - abs(target):+.2f} deg")
+    log(f"    {pad('プランナの運用限界', 28)}{wrist['max_deg'] - 5.0:+.2f} deg"
+        f"（実可動域から安全マージン 5 deg を引いたもの）")
+    log("                                このスクリプトは書き換えません")
 
-    log(f"\n  --- speed and time ---")
-    log(f"    unfolding, the first {100*BREAKOUT_FRACTION:.0f}%      "
-        f"{unfold_s:.1f} s at {BREAKOUT_SPEED_DEG_S:.1f} deg/s, then it stops "
-        f"and waits")
-    log(f"    the rest of the transit       {rest_s:.1f} s "
-        f"at {TRANSIT_SPEED_DEG_S:.0f} deg/s, interpolated at {FPS} Hz")
-    log(f"    wrist_flex {SAFE_DEG:+.0f} -> {target:+.0f}          "
-        f"{wrist_s:.1f} s at {WRIST_SPEED_DEG_S:.0f} deg/s")
-    log(f"    hold                          {args.hold:.1f} s, "
-        f"sampled at {SAMPLE_HZ} Hz")
-    log(f"    repeats                       {args.repeats} "
-        f"(return to {SAFE_DEG:+.0f} deg between them)")
+    log("\n  --- 速度と時間 ---")
+    log(f"    {pad(f'展開（最初の {100*BREAKOUT_FRACTION:.0f}%）', 28)}"
+        f"{unfold_s:.1f} s / {BREAKOUT_SPEED_DEG_S:.1f} deg/s、"
+        f"ここでいったん停止して待ちます")
+    log(f"    {pad('残りの移動', 28)}{rest_s:.1f} s / "
+        f"{TRANSIT_SPEED_DEG_S:.0f} deg/s、{FPS} Hz で補間")
+    log(f"    {pad(f'wrist_flex {SAFE_DEG:+.0f} → {target:+.0f}', 28)}"
+        f"{wrist_s:.1f} s / {WRIST_SPEED_DEG_S:.0f} deg/s")
+    log(f"    {pad('保持', 28)}{args.hold:.1f} s、{SAMPLE_HZ} Hz で記録")
+    log(f"    {pad('反復', 28)}{args.repeats} 回"
+        f"（間に {SAFE_DEG:+.0f} deg へ戻します）")
     total = (unfold_s + rest_s + args.repeats * (2 * wrist_s + args.hold)
              + unfold_s + rest_s)
-    log(f"    estimated total               {total:.0f} s, arm moving")
-    log(f"    Goal_Velocity written         {GOAL_VELOCITY_DEG_S:.0f} deg/s "
-        f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s), restored to 0 "
-        f"at the end")
-    log(f"    max_relative_target           {MAX_RELATIVE_TARGET_DEG:.1f} deg "
-        f"per command")
+    log(f"    {pad('動いている時間の目安', 28)}{total:.0f} s")
+    log(f"    {pad('Goal_Velocity 書き込み', 28)}{GOAL_VELOCITY_DEG_S:.0f} deg/s "
+        f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s)、終了時に 0 へ戻します")
+    log(f"    {pad('max_relative_target', 28)}{MAX_RELATIVE_TARGET_DEG:.1f} deg "
+        f"／ 1 指令")
 
-    log(f"\n  --- what stops the run ---")
-    log(f"    |Present_Load|                > {LOAD_ABORT} of 1023   "
-        f"(the twin predicts about 40 here)")
-    log(f"    tracking error                > {TRACKING_ABORT_DEG:.1f} deg")
-    log(f"    tracking error growing        > {TRACKING_RATE_ABORT_DEG_S:.1f} deg/s")
-    log(f"    temperature                   > {TEMPERATURE_ABORT_C} C "
-        f"(now {wrist['temperature']} C)")
-    log(f"    reads failing in a row        >= {COMMS_ABORT}")
-    log(f"    held off its command          > {STALL_ERROR_DEG:.1f} deg without "
-        f"moving {STALL_MOVEMENT_DEG:.1f} deg for {STALL_WINDOW_S:.0f} s")
-    log("    None of these is a safe level. A noise, a vibration or anything")
-    log("    that looks wrong is a reason to stop whatever the numbers say.")
+    log("\n  --- 走行を止める条件 ---")
+    log(f"    {pad('|Present_Load|', 28)}> {LOAD_ABORT} / 1023   "
+        f"（ツインの予測は 40 前後）")
+    log(f"    {pad('追従誤差', 28)}> {TRACKING_ABORT_DEG:.1f} deg")
+    log(f"    {pad('追従誤差の増加率', 28)}> {TRACKING_RATE_ABORT_DEG_S:.1f} deg/s")
+    log(f"    {pad('温度', 28)}> {TEMPERATURE_ABORT_C} C"
+        f"（現在 {wrist['temperature']} C）")
+    log(f"    {pad('連続した読み出し失敗', 28)}>= {COMMS_ABORT} 回")
+    log(f"    {pad('指令から外れたまま静止', 28)}> {STALL_ERROR_DEG:.1f} deg のずれで "
+        f"{STALL_MOVEMENT_DEG:.1f} deg も動かない状態が {STALL_WINDOW_S:.0f} s")
+    log("    いずれも「ここまでは安全」という意味ではありません。異常を早く")
+    log("    止めるための上限です。異音・振動・不自然な動きがあれば、数値が")
+    log("    条件を満たしていなくても止めてください。")
 
-    log("\n  --- what happens when one of them does ---")
-    log("    1. every joint's Present_Position is read, in ticks")
-    log("    2. Goal_Position is rewritten to that same Present_Position")
-    log(f"       - so the arm holds where it IS, not where it was last told to")
-    log(f"         be. Cutting the interpolation alone would leave the servo")
-    log(f"         pushing towards the command it had just failed to meet.")
-    log("    3. no further trajectory is commanded")
-    log("    4. torque stays ON - releasing a raised arm drops it")
-    log("    5. every joint's position, goal, load, temperature, voltage and")
-    log(f"       torque state is printed and written to summary.json")
-    log(f"    then it asks. After an abort, folding the arm back needs the word")
-    log(f"    'home' typed - ENTER alone leaves it holding.")
-    log(f"    If the bus will not answer, it says so and tells you to use")
-    log(f"    scripts/torque_off.py, which is the only case where that is right.")
+    log("\n  --- 条件に触れたとき何が起きるか ---")
+    log("    1. 全関節の Present_Position を ticks で読む")
+    log("    2. Goal_Position をその Present_Position へ書き換える")
+    log("       → アームは「いまいる場所」を保持します。補間を止めるだけでは、")
+    log("         直前の指令がサーボに残り、追従できなかったその指令に押し")
+    log("         続けることになります。")
+    log("    3. 以降の軌道指令は出しません")
+    log("    4. トルクは ON のまま（上げた腕を解放すれば落下します）")
+    log("    5. 全関節の位置・指令・負荷・温度・電圧・トルク状態を表示し、")
+    log("       summary.json に保存します")
+    log("    そのうえで問いかけます。異常停止のあと腕を畳むには 'home' の")
+    log("    入力が必要です。ENTER だけなら保持したままにします。")
+    log("    バスが応答しない場合はその旨を表示し、scripts/torque_off.py を")
+    log("    案内します。それが正しい唯一の場面です。")
 
-    log(f"\n  --- where it writes ---")
-    log(f"    output directory              {out_dir}"
-        f"{'  (not created; dry run)' if args.dry_run else ''}")
-    log(f"    lock                          {lock_path}  held by this process")
-    log(f"    existing results              never overwritten; every run gets "
-        f"its own timestamp")
+    log("\n  --- 書き込み先 ---")
+    log(f"    {pad('出力ディレクトリ', 28)}{out_dir}"
+        f"{'（dry run のため未作成）' if args.dry_run else ''}")
+    log(f"    {pad('ロック', 28)}{lock_path}（このプロセスが保持中）")
+    log(f"    {pad('既存の結果', 28)}上書きしません。実行ごとに別ディレクトリです")
 
-    log(f"\n  --- the twin's opinion of this plan ---")
-    log(f"    {'clear' if sim_clear else '*** NOT CLEAR - refusing ***'}")
+    log("\n  --- この計画に対するツインの判定 ---")
+    log(f"    {'問題なし' if sim_clear else '*** 干渉あり — 実行を拒否します ***'}")
     return sim_clear
 
 
@@ -630,31 +662,31 @@ def git_state():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Confirm one wrist_flex angle is safe to work at. "
-                    "One angle per run, on purpose.")
+        description="wrist_flex の 1 つの角度が実用できるかを確認します。"
+                    "意図的に、1 回の実行につき 1 角度だけです。")
     parser.add_argument("--to", type=float, required=True, metavar="DEG",
-                        help=f"the wrist_flex angle to check, "
+                        help=f"確認する wrist_flex の角度。"
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
     parser.add_argument("--dry-run", action="store_true",
-                        help="report the whole plan and move nothing")
+                        help="計画を表示するだけで、何も動かしません")
     parser.add_argument("--posture", choices=sorted(POSTURES), default="upright",
-                        help="the arm posture the wrist is swung in")
+                        help="手首を振るときのアームの姿勢")
     parser.add_argument("--hold", type=float, default=3.0,
-                        help="seconds to hold at the target")
+                        help="目標角で保持する秒数")
     parser.add_argument("--repeats", type=int, default=2,
-                        help="how many times to go there (repeatability)")
+                        help="目標角へ行く回数（再現性の確認）")
     parser.add_argument("--follower-port", default="COM4")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
     if abs(args.to) > LIMIT_DEG:
         raise SystemExit(
-            f"\n  {args.to:+.1f} deg is outside the +-{LIMIT_DEG:.0f} deg R1 "
-            f"allows.\n  There is no override flag, and this is not the place "
-            f"to add one: past\n  here wrist_flex has under 6 degrees left "
-            f"before the servo's own stop.\n")
+            f"\n  {args.to:+.1f} deg は R1 が許す ±{LIMIT_DEG:.0f} deg の"
+            f"外側です。\n  上書きするフラグはありませんし、ここに足すべきでも"
+            f"ありません。\n  この先は、サーボ自身の停止位置まで 6 deg を"
+            f"切ります。\n")
     if args.repeats < 1:
-        raise SystemExit("  --repeats has to be at least 1")
+        raise SystemExit("  --repeats は 1 以上にしてください")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     direction = "pos" if args.to >= 0 else "neg"
@@ -666,24 +698,25 @@ def main():
 
     with only_one(lock_path):
         log = Log()
-        log(f"\n  Phase R1: wrist_flex at {args.to:+.1f} deg, posture "
-            f"{args.posture!r}, port {port}")
-        log(f"  {'DRY RUN - nothing will move' if args.dry_run else 'LIVE'}")
+        log(f"\n  Phase R1: wrist_flex {args.to:+.1f} deg、姿勢 "
+            f"{args.posture!r}、ポート {port}")
+        log("  " + ("DRY RUN — 何も動かしません" if args.dry_run
+                    else "LIVE — 実機が動きます"))
 
         arm = read_arm(port)
         posture = dict(POSTURES[args.posture])
 
-        log(f"\n  --- checking the plan against the MuJoCo twin ---")
+        log("\n  --- MuJoCo ツインで計画を検査します ---")
         start_deg = {name: arm[name]["deg"] for name in ARM_JOINTS}
         clear = sim_check(start_deg, posture, args.to, log)
 
         ok = plan_report(args, arm, posture, out_dir, lock_path, log, clear)
         if args.dry_run:
-            log(f"\n  Dry run. Nothing moved, nothing was written.\n")
+            log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
         if not ok:
             raise SystemExit(
-                "\n  The twin says this plan is not clear. Refusing to move.\n")
+                "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
 
         run(args, arm, posture, port, out_dir, log)
 
@@ -692,29 +725,28 @@ def run(args, arm, posture, port, out_dir, log):
     """Everything from here on moves the arm."""
     import numpy as np  # noqa: F401 - summarise needs it; fail early if absent
 
-    log("\n  --- before connecting ---")
-    log("    robot.connect() enables torque. Treat connecting as starting.")
-    log("    Confirm, out loud, all four:")
-    log("      1. nothing and nobody is inside the arm's reach")
-    log(f"      2. the arm will stand about 400 mm tall in the {args.posture!r} "
-        f"posture,")
-    log("         and the space above it is clear")
-    log("      3. the power can be cut immediately - and the arm falls when it is")
-    log("      4. a second terminal is open, in this directory")
+    log("\n  --- 接続する前に ---")
+    log("    robot.connect() でトルクが入ります。接続＝始動と考えてください。")
+    log("    4 つとも、声に出して確認してください:")
+    log("      1. アームの可動範囲に人も物もない")
+    log(f"      2. {args.posture!r} 姿勢でアームは約 400 mm の高さに立つ。"
+        f"その上方が空いている")
+    log("      3. 電源をすぐ落とせる — そして落とせばアームは落下する")
+    log("      4. このディレクトリで 2 つ目のターミナルが開いている")
     log("")
-    log("    Emergency stop, in order:")
-    log("      A. Ctrl-C here             - stops commanding, keeps holding")
-    log("      B. second terminal:  uv run scripts/torque_off.py COM4")
-    log("         (only reaches the servos once this process has let the port go)")
-    log("      C. cut the power           - support the arm first")
+    log("    緊急停止は、この順で:")
+    log("      A. ここで Ctrl-C        — 指令を止め、その場で保持します")
+    log("      B. 2 つ目のターミナル:  uv run scripts/torque_off.py COM4")
+    log("         （このプロセスがポートを手放したあとでなければ届きません）")
+    log("      C. 電源を落とす         — 先にアームを支えてください")
     # The word, not ENTER. Every other prompt in this run takes ENTER, and this
     # one deliberately does not: it is the moment torque comes on, and a
     # keystroke made out of rhythm should not be able to start the arm.
-    if input("\n  Type 'ready' to connect, anything else to stop: ").strip() \
+    if input("\n  接続するなら ready と入力（それ以外は中止）: ").strip() \
             .lower() != "ready":
-        log("  stopped before connecting - nothing moved, nothing written")
-        log("  (this prompt wants the word 'ready'; ENTER alone stops. Every")
-        log("   prompt after it takes ENTER.)")
+        log("  接続前に中止しました。何も動かしておらず、何も書いていません。")
+        log("  （このプロンプトだけは ready の入力が必要です。ENTER だけなら")
+        log("    中止します。これ以降のプロンプトは ENTER で進みます。）")
         return
 
     from so101.hardware import bus_patch  # noqa: F401  serial retries
@@ -772,89 +804,89 @@ def run(args, arm, posture, port, out_dir, log):
             port=port, id="follower",
             max_relative_target=MAX_RELATIVE_TARGET_DEG))
         robot.connect()
-        log("\n  connected; torque is on and the arm is holding where it is")
+        log("\n  接続しました。トルクが入り、アームはその場を保持しています")
 
         for name in ARM_JOINTS:
             robot.bus.write("Goal_Velocity", name, goal_velocity)
-        log(f"  Goal_Velocity set to {goal_velocity} ticks/s "
-            f"({GOAL_VELOCITY_DEG_S:.0f} deg/s) on the five arm joints")
+        log(f"  アーム 5 関節の Goal_Velocity を {goal_velocity} ticks/s "
+            f"({GOAL_VELOCITY_DEG_S:.0f} deg/s) に設定しました")
 
         watch = Watch(robot, writer, log, args.to)
         here = joints_of(robot)
-        log(f"  reads back at {', '.join(f'{n} {here[n]:+.1f}' for n in ARM_JOINTS)}")
+        log("  読み戻し: "
+            + "、".join(f"{n} {here[n]:+.1f}" for n in ARM_JOINTS))
 
         # -- 1. to the posture --------------------------------------------
         goal = dict(posture, wrist_flex=SAFE_DEG)
         biggest = max(abs(goal[n] - here[n]) for n in goal)
         unfold_s, rest_s = transit_times(biggest)
-        log(f"\n  --- transit to {args.posture!r}, largest move "
+        log(f"\n  --- {args.posture!r} へ移動します。最大移動量 "
             f"{biggest:.1f} deg ---")
-        log(f"  in two parts. The first {100*BREAKOUT_FRACTION:.0f}% "
-            f"({biggest * BREAKOUT_FRACTION:.1f} deg) goes at "
-            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s, because that is the arm")
-        log(f"  unfolding out of a pose it is resting against itself in; the "
-            f"rest at {TRANSIT_SPEED_DEG_S:.0f} deg/s.")
-        if input("  Press ENTER to move, anything else to stop: ").strip():
+        log(f"  2 段に分けます。最初の {100*BREAKOUT_FRACTION:.0f}% "
+            f"({biggest * BREAKOUT_FRACTION:.1f} deg) は "
+            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s。")
+        log("  そこが、自身に寄りかかった姿勢から抜け出す区間だからです。")
+        log(f"  残りは {TRANSIT_SPEED_DEG_S:.0f} deg/s。")
+        if input("  動かすなら ENTER（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
 
         part = {n: here[n] + (goal[n] - here[n]) * BREAKOUT_FRACTION
                 for n in goal}
         glide(robot, watch, part, unfold_s, "unfold", 0, log)
         broke_out = joints_of(robot)
-        log("  out of the fold: "
-            + ", ".join(f"{n} {broke_out[n]:+.2f}" for n in ARM_JOINTS))
-        log(f"    wrist_flex load {watch.rows[-1]['load']}, "
-            f"{watch.rows[-1]['temperature_c']} C, "
-            f"tracking {watch.rows[-1]['tracking_error_deg']:+.2f} deg")
-        if input("  Nothing odd? ENTER to continue, anything else to stop: "
-                 ).strip():
+        log("  折り畳みから抜けました: "
+            + "、".join(f"{n} {broke_out[n]:+.2f}" for n in ARM_JOINTS))
+        log(f"    wrist_flex  負荷 {watch.rows[-1]['load']}、"
+            f"{watch.rows[-1]['temperature_c']} C、"
+            f"追従誤差 {watch.rows[-1]['tracking_error_deg']:+.2f} deg")
+        if input("  異常がなければ ENTER で継続（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
 
         glide(robot, watch, goal, rest_s, "transit", 0, log)
         arrived = joints_of(robot)
-        log(f"  arrived: " + ", ".join(f"{n} {arrived[n]:+.2f}" for n in ARM_JOINTS))
+        log("  到着: " + "、".join(f"{n} {arrived[n]:+.2f}" for n in ARM_JOINTS))
         result["posture_reached_deg"] = {n: round(arrived[n], 2)
                                          for n in ARM_JOINTS}
 
         # -- 2. the angle, more than once ---------------------------------
         wrist_s = max(3.0, abs(args.to - SAFE_DEG) / WRIST_SPEED_DEG_S)
         for repeat in range(1, args.repeats + 1):
-            log(f"\n  --- repeat {repeat}/{args.repeats}: "
-                f"{SAFE_DEG:+.0f} -> {args.to:+.1f} deg over {wrist_s:.1f} s ---")
-            if input("  Press ENTER to go, anything else to stop: ").strip():
+            log(f"\n  --- {repeat}/{args.repeats} 回目: "
+                f"{SAFE_DEG:+.0f} → {args.to:+.1f} deg を {wrist_s:.1f} s で ---")
+            if input("  進めるなら ENTER（それ以外は中止）: ").strip():
                 raise KeyboardInterrupt
 
             glide(robot, watch, {JOINT: args.to}, wrist_s, "approach", repeat, log)
             taken = hold(robot, watch, args.to, args.hold, repeat, log)
             stats = summarise(taken, f"hold {repeat}")
             result["holds"].append(stats)
-            log(f"    settled at {stats['measured_mean_deg']:+.2f} deg "
-                f"(drift {stats['measured_drift_deg']:.2f} deg over the hold)")
-            log(f"    tracking error  mean {stats['tracking_error_mean_deg']:.2f}"
-                f"  median {stats['tracking_error_median_deg']:.2f}"
+            log(f"    静定角 {stats['measured_mean_deg']:+.2f} deg"
+                f"（保持中のぶれ {stats['measured_drift_deg']:.2f} deg）")
+            log(f"    追従誤差  平均 {stats['tracking_error_mean_deg']:.2f}"
+                f"  中央 {stats['tracking_error_median_deg']:.2f}"
                 f"  p95 {stats['tracking_error_p95_deg']:.2f}"
-                f"  worst {stats['tracking_error_worst_deg']:.2f} deg")
-            log(f"    load            mean {stats['load_mean']:.0f}"
+                f"  最大 {stats['tracking_error_worst_deg']:.2f} deg")
+            log(f"    負荷      平均 {stats['load_mean']:.0f}"
                 f"  p95 {stats['load_p95']:.0f}"
-                f"  worst {stats['load_worst']} of 1023")
-            log(f"    temperature     {stats['temperature_start_c']} -> "
+                f"  最大 {stats['load_worst']} / 1023")
+            log(f"    温度      {stats['temperature_start_c']} → "
                 f"{stats['temperature_end_c']} C")
 
-            log(f"    back to {SAFE_DEG:+.0f} deg")
+            log(f"    {SAFE_DEG:+.0f} deg へ戻します")
             glide(robot, watch, {JOINT: SAFE_DEG}, wrist_s, "return", repeat, log)
 
         result["current_register_ever_nonzero"] = watch.current_ever_nonzero
         if not watch.current_ever_nonzero:
-            log("\n  Present_Current read 0 throughout - this servo does not "
-                "appear to report it. Present_Load is the load measurement.")
+            log("\n  Present_Current は終始 0 でした。このサーボは電流を報告"
+                "していないようです。負荷の指標は Present_Load です。")
 
     except Abort as error:
         aborted = str(error)
-        log(f"\n  *** ABORT: {error} ***")
+        log(f"\n  *** 異常停止: {error} ***")
         result["freeze"] = freeze(robot, log, watch, aborted)
     except KeyboardInterrupt:
-        aborted = "stopped by the operator"
-        log("\n  stopped by the operator")
+        aborted = "操作者が中止しました"
+        log("\n  操作者が中止しました")
         result["freeze"] = freeze(robot, log, watch, aborted)
     except Exception as error:  # noqa: BLE001
         aborted = f"{type(error).__name__}: {error}"
@@ -868,16 +900,16 @@ def run(args, arm, posture, port, out_dir, log):
             park(robot, watch, home, goal_velocity, log, aborted)
             try:
                 robot.disconnect()
-                log("  disconnected; torque released")
+                log("  切断しました。トルクを解放しました")
             except Exception as error:  # noqa: BLE001
-                log(f"  could not disconnect cleanly: {error}")
-                log("  run:  uv run scripts/torque_off.py COM4")
+                log(f"  正常に切断できませんでした: {error}")
+                log("  実行してください:  uv run scripts/torque_off.py COM4")
         handle.close()
         verdict(result, args, log)
         (out_dir / "summary.json").write_text(
             json.dumps(result, indent=2), encoding="utf-8")
-        log(f"\n  samples  {samples_path}")
-        log(f"  summary  {out_dir / 'summary.json'}")
+        log(f"\n  全サンプル  {samples_path}")
+        log(f"  まとめ      {out_dir / 'summary.json'}")
         log.close()
 
 
@@ -915,20 +947,21 @@ def freeze(robot, log, watch=None, reason=""):
                                  num_retry=FREEZE_RETRIES)
             break
         except Exception as error:  # noqa: BLE001 - keep trying, then say so
-            log(f"  freeze attempt {attempt}/{FREEZE_ATTEMPTS} failed: {error}")
+            log(f"  その場保持 {attempt}/{FREEZE_ATTEMPTS} 回目に失敗: {error}")
     else:
-        log("\n  *** COULD NOT FREEZE - the arm may still be driving towards "
-            "its last command ***")
-        log("  Support the arm, then in the other terminal:")
+        log("\n  *** その場保持に失敗しました — アームがまだ直前の指令へ"
+            "向かっている可能性があります ***")
+        log("  アームを支えたうえで、もう一方のターミナルで:")
         log("    taskkill /F /IM python.exe")
         log("    uv run scripts/torque_off.py COM4")
         return {"frozen": False, "why": "the bus would not answer"}
 
-    log("  frozen: Goal_Position rewritten to Present_Position on all six "
-        "joints; torque stays ON and the arm holds where it is")
+    log("  その場保持: 全 6 関節の Goal_Position を Present_Position へ"
+        "書き換えました。トルクは ON のまま、いまいる場所を保持します")
     state = {"frozen": True, "reason": reason, "joints": {}}
-    log(f"    {'joint':<15}{'deg':>9}{'ticks':>8}{'goal':>8}{'load':>7}"
-        f"{'temp':>7}{'volt':>7}{'torque':>8}")
+    log("    " + pad("joint", 15) + rpad("現在角", 9) + rpad("ticks", 8)
+        + rpad("指令", 8) + rpad("負荷", 7) + rpad("温度", 7)
+        + rpad("電圧", 7) + rpad("torque", 8))
     for name in (*ARM_JOINTS, "gripper"):
         row = {}
         for register, key in (("Present_Position", "ticks"),
@@ -959,11 +992,11 @@ def freeze(robot, log, watch=None, reason=""):
     if watch is not None:
         try:
             watch.sample("frozen", 0, state["joints"][JOINT]["deg"] or 0.0,
-                         status="abort", notes=reason)
+                         status="abort", notes=reason)  # noqa: E501
         except Exception:  # noqa: BLE001 - the record is not worth a second fault
             pass
-    log("\n  The arm is holding. Look at it - listen to it - before deciding "
-        "what to do.")
+    log("\n  アームは保持しています。どうするか決める前に、見て、音を"
+        "聞いてください。")
     return state
 
 
@@ -974,30 +1007,32 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
     from 400 mm; the pose it was found in is the one it was already holding
     without any torque at all, so that is where it is put back.
     """
-    log("\n  --- parking ---")
-    log("  The arm is raised. Releasing torque here would drop it, so it goes")
-    log("  back to the folded pose it was found in first.")
+    log("\n  --- 収納 ---")
+    log("  アームは上がっています。ここでトルクを切れば落下するので、先に")
+    log("  見つけたときの折り畳み姿勢へ戻します。")
     try:
         if aborted:
             # After an abort the arm is holding a pose nobody planned, and the
             # reason it stopped has not been looked at yet. Moving is then the
             # answer that has to be asked for, not the one that happens by
             # pressing ENTER.
-            log(f"  This run stopped early: {aborted}")
-            log("  Moving now is only safe once you know why.")
-            answer = input("  Type 'home' to fold it back, anything else to "
-                           "leave it holding: ").strip().lower()
+            log(f"  この実行は途中で止まりました: {aborted}")
+            log("  理由が分かるまで、動かすのは安全ではありません。")
+            answer = input("  畳むなら home と入力（それ以外は保持のまま）: "
+                           ).strip().lower()
             if answer != "home":
-                log("  left holding, torque on. Lower it before cutting power.")
-                log("  when ready:  uv run scripts/torque_off.py COM4")
+                log("  保持したままにします（トルク ON）。電源を切る前に"
+                    "下ろしてください。")
+                log("  準備ができたら:  uv run scripts/torque_off.py COM4")
                 return
-        elif input("  Press ENTER to bring it home, or 'hold' to leave it "
-                   "holding: ").strip().lower() == "hold":
-            log("  left holding, torque on. Lower it before cutting power.")
-            log("  when ready:  uv run scripts/torque_off.py COM4")
+        elif input("  戻すなら ENTER、保持したままにするなら hold: "
+                   ).strip().lower() == "hold":
+            log("  保持したままにします（トルク ON）。電源を切る前に"
+                "下ろしてください。")
+            log("  準備ができたら:  uv run scripts/torque_off.py COM4")
             return
     except (EOFError, KeyboardInterrupt):
-        log("  left holding, torque on.")
+        log("  保持したままにします（トルク ON）。")
         return
 
     try:
@@ -1010,10 +1045,10 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
         # swung through anything on the way down.
         _quiet_glide(robot, {JOINT: SAFE_DEG}, 4.0)
         _quiet_glide(robot, dict(home), glide_home)
-        log("  home")
+        log("  収納しました")
     except Exception as error:  # noqa: BLE001 - parking must not itself fail
-        log(f"  could not park cleanly: {error}")
-        log("  the arm is where it stopped, torque on. Support it, then:")
+        log(f"  正常に収納できませんでした: {error}")
+        log("  アームは止まった位置にあり、トルクは ON です。支えたうえで:")
         log("    uv run scripts/torque_off.py COM4")
         return
 
@@ -1022,7 +1057,7 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
             robot.bus.write("Goal_Velocity", name, 0)
         except Exception:  # noqa: BLE001
             pass
-    log(f"  Goal_Velocity restored to 0")
+    log("  Goal_Velocity を 0 へ戻しました")
 
 
 def _quiet_glide(robot, goal, seconds):
@@ -1039,13 +1074,14 @@ def _quiet_glide(robot, goal, seconds):
 def verdict(result, args, log):
     """What the run showed. Not a joint limit - R1 does not decide one."""
     holds = result.get("holds", [])
-    log(f"\n  === wrist_flex {args.to:+.1f} deg, {result['direction']} side ===")
+    side = "正側" if result["direction"] == "positive" else "負側"
+    log(f"\n  === wrist_flex {args.to:+.1f} deg（{side}）===")
     if result.get("aborted"):
-        log(f"  did not complete: {result['aborted']}")
+        log(f"  完了しませんでした: {result['aborted']}")
         result["verdict"] = "aborted"
         return
     if len(holds) < args.repeats:
-        log(f"  only {len(holds)} of {args.repeats} repeats completed")
+        log(f"  {args.repeats} 回中 {len(holds)} 回しか完了していません")
         result["verdict"] = "incomplete"
         return
 
@@ -1061,17 +1097,17 @@ def verdict(result, args, log):
         "load_worst": worst_load,
         "hold_drift_worst_deg": round(worst_drift, 3),
     }
-    log(f"  settled at {', '.join(f'{s:+.2f}' for s in settled)} deg "
-        f"- spread {spread:.2f} deg")
-    log(f"  worst tracking error {worst_error:.2f} deg, worst load "
-        f"{worst_load} of 1023, worst drift while holding {worst_drift:.2f} deg")
+    log(f"  静定角 {'、'.join(f'{s:+.2f}' for s in settled)} deg"
+        f" — ばらつき {spread:.2f} deg")
+    log(f"  追従誤差の最大 {worst_error:.2f} deg、負荷の最大 {worst_load} / 1023、"
+        f"保持中のぶれの最大 {worst_drift:.2f} deg")
 
     good = (worst_error < 2.0 and worst_load < 200 and spread < 1.0
             and worst_drift < 0.5)
     result["verdict"] = "ordinary" if good else "review"
-    log(f"  -> {'nothing out of the ordinary' if good else 'worth a look'}")
-    log("\n  This is evidence about one angle, not an operational limit.")
-    log("  The limit is decided once both directions have been walked out.")
+    log("  → " + ("異常なし" if good else "確認が必要です"))
+    log("\n  これは 1 つの角度についての記録であって、運用限界ではありません。")
+    log("  限界は、正負どちらも歩き終えてから決めます。")
 
 
 if __name__ == "__main__":

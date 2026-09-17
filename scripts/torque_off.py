@@ -37,6 +37,15 @@ from so101.hardware.sts3215 import (  # noqa: E402
     TICKS_PER_DEG,
 )
 
+# See the note in check_wrist_flex_operational_range.py: console output is fine
+# whatever the code page, but a redirect falls back to cp932. This is the
+# emergency script - it must not be the thing that raises.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ATTEMPTS = 5
 
 
@@ -45,12 +54,12 @@ def release(bus, sid, name, report_only):
     position = bus.read(sid, PRESENT_POSITION, 2)
     before = bus.read(sid, TORQUE_ENABLE, 1)
     if position is None or before is None:
-        return f"  {name:<14} no answer"
+        return f"  {name:<14} 応答なし"
     where = f"{position:>5} ticks ({position / TICKS_PER_DEG:>6.1f}d)"
     if report_only:
         return f"  {name:<14} {where}  torque {before}"
     if before == 0:
-        return f"  {name:<14} {where}  torque already off"
+        return f"  {name:<14} {where}  すでに OFF"
 
     # Park the goal where the joint actually is first. A servo whose goal is far
     # from its position will lunge there the moment torque comes back on, and
@@ -59,22 +68,24 @@ def release(bus, sid, name, report_only):
     for _ in range(ATTEMPTS):
         bus.write(sid, TORQUE_ENABLE, 0)
         if bus.read(sid, TORQUE_ENABLE, 1) == 0:
-            return f"  {name:<14} {where}  torque OFF"
-    return f"  {name:<14} {where}  *** STILL ON after {ATTEMPTS} tries ***"
+            return f"  {name:<14} {where}  トルク OFF"
+    return f"  {name:<14} {where}  *** {ATTEMPTS} 回試しても OFF になりません ***"
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("ports", nargs="*", help="e.g. COM4; default is all found")
+    parser = argparse.ArgumentParser(
+        description="アームの全サーボのトルクを解放します（緊急停止 B 系統）。")
+    parser.add_argument("ports", nargs="*",
+                        help="例: COM4。省略すると見つかった全ポート")
     parser.add_argument("--report", action="store_true",
-                        help="show the torque state and change nothing")
+                        help="トルクの状態を表示するだけで、何も変更しません")
     args = parser.parse_args()
 
     from so101.hardware import resolve as resolve_port
 
     if not args.report:
-        print("\n  *** The arm falls when torque is released. Support it first "
-              "if it is raised. ***\n")
+        print("\n  *** トルクを解放するとアームは落下します。"
+              "上がっているなら先に支えてください。 ***\n")
 
     failed = False
     for port in resolve_port(args.ports):
@@ -83,20 +94,22 @@ def main():
             with Bus(port) as bus:
                 for sid, name in JOINT_NAMES.items():
                     if not bus.ping(sid):
-                        print(f"  {name:<14} NO RESPONSE")
+                        print(f"  {name:<14} 応答なし")
                         failed = True
                         continue
                     line = release(bus, sid, name, args.report)
                     print(line)
-                    failed = failed or "STILL ON" in line
+                    failed = failed or "***" in line
         except Exception as error:  # noqa: BLE001 - report, do not raise
-            print(f"  cannot open {port}: {error}")
-            print("  another process is probably still holding it - kill it first")
+            print(f"  {port} を開けません: {error}")
+            print("  別のプロセスがまだ保持しています。先にそれを止めてください:")
+            print("    taskkill /F /IM python.exe")
             failed = True
         print()
 
     if failed and not args.report:
-        print("  Not every servo confirmed. Cut the power, supporting the arm.")
+        print("  全サーボの OFF を確認できませんでした。"
+              "アームを支えたうえで電源を落としてください。")
         sys.exit(1)
 
 
