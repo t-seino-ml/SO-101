@@ -707,9 +707,14 @@ def run(args, arm, posture, port, out_dir, log):
     log("      B. second terminal:  uv run scripts/torque_off.py COM4")
     log("         (only reaches the servos once this process has let the port go)")
     log("      C. cut the power           - support the arm first")
+    # The word, not ENTER. Every other prompt in this run takes ENTER, and this
+    # one deliberately does not: it is the moment torque comes on, and a
+    # keystroke made out of rhythm should not be able to start the arm.
     if input("\n  Type 'ready' to connect, anything else to stop: ").strip() \
             .lower() != "ready":
-        log("  stopped before connecting")
+        log("  stopped before connecting - nothing moved, nothing written")
+        log("  (this prompt wants the word 'ready'; ENTER alone stops. Every")
+        log("   prompt after it takes ENTER.)")
         return
 
     from so101.hardware import bus_patch  # noqa: F401  serial retries
