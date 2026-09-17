@@ -626,7 +626,7 @@ def check_path_shape(stages, start, log):
     ok = True
     log("    " + pad("stage", 30) + rpad("最大の 1 歩", 14)
         + rpad("向きの反転", 12) + "   判定")
-    for label, path in stages:
+    for label, path, _kind in stages:
         biggest, reversals, where = 0.0, 0, ""
         previous = dict(start)
         directions = {}
@@ -656,7 +656,7 @@ def check_path_shape(stages, start, log):
 def check_limits(stages, arm, log):
     """Is every waypoint inside the servos' own limits? Returns True if so."""
     worst = {}
-    for label, path in stages:
+    for label, path, _kind in stages:
         for index, point in enumerate(path, 1):
             for name, value in point.items():
                 low = arm[name]["min_deg"] + LIMIT_MARGIN_DEG
@@ -715,11 +715,12 @@ def replay(stages, start, table, log, fine=6):
     if baseline:
         log(f"    この姿勢はすでに自身に接触しています: {sorted(baseline)}")
     log("")
-    log("    " + pad("stage", 30) + rpad("点", 5) + rpad("最小 全体", 13)
-        + rpad("グリッパ", 13) + "   判定")
+    log("    " + pad("stage", 30) + pad("種別", 9) + rpad("点", 5)
+        + rpad("最小 全体", 11) + rpad("グリッパ", 11) + "   判定")
 
     start_grip = table.gripper_gap(start)
     tolerance = APPROACH_TOLERANCE_MM / 1000
+    floor = CLEARANCE_FLOOR_MM / 1000
     clear = True
     report = {"table_z_mm": round(1000 * table_z, 3),
               "clearance_floor_mm": CLEARANCE_FLOOR_MM,
@@ -728,9 +729,9 @@ def replay(stages, start, table, log, fine=6):
               "start_clearance_mm": round(1000 * parked, 2),
               "start_gripper_clearance_mm": round(1000 * start_grip, 2),
               "stages": []}
-    for label, path in stages:
+    for label, path, kind in stages:
         least, least_grip = float("inf"), float("inf")
-        offenders, worst_at, closed_at = set(), None, None
+        offenders, worst_at, closed_at, below_at = set(), None, None, None
         previous = dict(here)
         for target in path:
             for step in range(1, fine + 1):
@@ -743,29 +744,46 @@ def replay(stages, start, table, log, fine=6):
                     least, worst_at = gap, dict(pose)
                 if grip < least_grip:
                     least_grip = grip
-                # Getting closer to the table than the arm started is the fault
-                # this run is really looking for, and it is asked of the gripper
-                # as well as of the arm as a whole.
-                if closed_at is None and (gap < parked - tolerance
-                                          or grip < start_grip - tolerance):
-                    closed_at = (dict(pose), gap, grip)
+                # A transit and a sweep fail differently, and judging them
+                # alike was wrong: turning the wrist down from the posture
+                # lowers the gripper by 120 mm on purpose, and calling that
+                # "approaching the table" would refuse the only move the whole
+                # phase exists to make. So a transit may not get closer to the
+                # table than it started - the criterion that survives the
+                # model's unknown offset - and a sweep is held to the floor
+                # instead, which is what it is for.
+                if kind == "transit":
+                    if closed_at is None and (gap < parked - tolerance
+                                              or grip < start_grip - tolerance):
+                        closed_at = (dict(pose), gap, grip)
+                elif below_at is None and min(gap, grip) < floor:
+                    below_at = (dict(pose), gap, grip)
                 offenders |= (found - baseline)
             previous = dict(previous)
             previous.update(target)
             here.update(target)
 
-        ok = not offenders and closed_at is None
-        log(f"    {pad(label, 30)}{len(path):>5}{1000*least:>13.1f}"
-            f"{1000*least_grip:>13.1f}   "
-            f"{'机へ近づきません' if ok else '*** 不可 ***'}")
+        ok = not offenders and closed_at is None and below_at is None
+        verdict = ("机へ近づきません" if kind == "transit"
+                   else f"{CLEARANCE_FLOOR_MM:.0f} mm を保ちます")
+        log(f"    {pad(label, 30)}{pad(kind, 9)}{len(path):>5}"
+            f"{1000*least:>11.1f}{1000*least_grip:>11.1f}   "
+            f"{verdict if ok else '*** 不可 ***'}")
         report["stages"].append({
-            "stage": label, "waypoints": len(path),
+            "stage": label, "kind": kind, "waypoints": len(path),
             "min_clearance_mm": round(1000 * least, 2),
             "min_gripper_clearance_mm": round(1000 * least_grip, 2),
-            "never_approaches": closed_at is None,
+            "never_approaches": None if kind != "transit" else closed_at is None,
+            "above_floor": None if kind == "transit" else below_at is None,
             "no_new_contacts": not offenders, "ok": bool(ok)})
         if offenders:
             log(f"      新たな自己干渉: {sorted(offenders)}")
+            clear = False
+        if below_at is not None:
+            pose, gap, grip = below_at
+            log(f"      下限 {CLEARANCE_FLOOR_MM:.0f} mm を割ります: 全体 "
+                f"{1000*gap:+.1f} mm、グリッパ {1000*grip:+.1f} mm。そのときの姿勢:")
+            log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
             clear = False
         if closed_at is not None:
             pose, gap, grip = closed_at
@@ -780,7 +798,8 @@ def replay(stages, start, table, log, fine=6):
     report["min_gripper_clearance_mm"] = min(s["min_gripper_clearance_mm"]
                                              for s in report["stages"])
     report["never_approaches"] = all(s["never_approaches"]
-                                     for s in report["stages"])
+                                     for s in report["stages"]
+                                     if s["never_approaches"] is not None)
     log(f"\n    経路全体の最小   全体 {report['min_clearance_mm']:+.1f} mm、"
         f"グリッパ {report['min_gripper_clearance_mm']:+.1f} mm")
     log(f"    開始時からの悪化   "
@@ -804,18 +823,18 @@ def stages_for(start, posture, target_deg, repeats, posture_only,
     out = []
     lifted = dict(start)
     if liftoff:
-        out.append(("離陸（机から離す）", waypoints(start, liftoff)))
+        out.append(("離陸（机から離す）", waypoints(start, liftoff), "transit"))
         lifted.update(liftoff)
-    out.append((f"{posture_name} へ", waypoints(lifted, upright)))
+    out.append((f"{posture_name} へ", waypoints(lifted, upright), "transit"))
     if posture_only:
         return out
     here = dict(upright)
     for repeat in range(1, repeats + 1):
         out.append((f"{repeat} 回目: wrist_flex → {target_deg:+.0f}",
-                    waypoints(here, {JOINT: target_deg})))
+                    waypoints(here, {JOINT: target_deg}), "sweep"))
         here[JOINT] = target_deg
         out.append((f"{repeat} 回目: wrist_flex → {SAFE_DEG:+.0f}",
-                    waypoints(here, {JOINT: SAFE_DEG})))
+                    waypoints(here, {JOINT: SAFE_DEG}), "sweep"))
         here[JOINT] = SAFE_DEG
     return out
 
@@ -1184,7 +1203,7 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
 
     log("\n  --- 送信する waypoint 列（ツインが再生したものと同一）---")
     total = 0
-    for label, path in stages:
+    for label, path, _kind in stages:
         total += len(path)
         biggest = 0.0
         previous = None
@@ -1260,7 +1279,7 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
            else "*** 近づきます — 実行を拒否します ***")
         + f"（許容 {clearance['approach_tolerance_mm']:.1f} mm）")
     for stage in clearance["stages"]:
-        log(f"      {pad(stage['stage'], 28)}"
+        log(f"      {pad(stage['stage'], 28)}{pad(stage['kind'], 9)}"
             f"{stage['min_clearance_mm']:>7.1f}{stage['min_gripper_clearance_mm']:>9.1f} mm"
             f"  {'OK' if stage['ok'] else '*** 不可 ***'}")
     log("    モデルの絶対値は実測と 17.6 / 45.3 mm ずれていました（2 姿勢で測定）。")
