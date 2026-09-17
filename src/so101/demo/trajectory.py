@@ -100,9 +100,19 @@ HOLDING_MARGIN_DEG = 4.0
 #: be squeezed without being burnt out. Aborting on it aborted on success.
 LOAD_ABORT = 450
 TEMPERATURE_ABORT_C = 55
-#: Nothing may be commanded further than this from where the arm is. A taught
-#: file is trusted, but not so far that a corrupted number can fling the arm.
-MAX_STEP_DEG = 120.0
+#: How far the arm may be flung to reach the *first* waypoint.
+#:
+#: This one is strict because nothing is known about where the arm is: it may
+#: have been left mid-trajectory by an abort, or moved by hand. A taught file is
+#: trusted, but not far enough to cross the workspace from an unknown start.
+MAX_FIRST_STEP_DEG = 120.0
+#: And between waypoints, where much more is known: both ends are poses a person
+#: drove the arm to and watched, in one continuous motion, minutes ago. A folded
+#: HOME to an extended PREGRASP is legitimately large - 84 degrees on slot 1, 93
+#: on slot 2, 125 on slot 4 - and refusing that refused a taught pick for being
+#: what it was taught as. What is left to catch here is a corrupted file, so the
+#: bound is one that no real pair of poses reaches.
+MAX_STEP_DEG = 180.0
 FPS = 30
 
 SLOT_DIR = Path("data/demo_slots")
@@ -219,10 +229,25 @@ class Trajectory:
             first = self.waypoints[0]
             step = max(abs(first.joints[n] - start[n]) for n in first.joints)
             log(f"    いまの姿勢から最初の waypoint まで {step:.1f} deg")
-            if step > MAX_STEP_DEG:
+            if step > MAX_FIRST_STEP_DEG:
                 problems.append(
                     f"最初の waypoint が現在姿勢から {step:.0f} deg 離れています"
-                    f"（上限 {MAX_STEP_DEG:.0f}）")
+                    f"（上限 {MAX_FIRST_STEP_DEG:.0f}）")
+
+        # The largest step between two taught poses, so a person sees the
+        # biggest single move the run will make before it makes it.
+        biggest, where = 0.0, ""
+        previous = self.waypoints[0]
+        for point in self.waypoints[1:]:
+            step = max(abs(point.joints[n] - previous.joints[n])
+                       for n in point.joints)
+            if step > biggest:
+                biggest, where = step, f"{previous.phase} → {point.phase}"
+            previous = point
+        log(f"    waypoint 間の最大移動 {biggest:.1f} deg（{where}）")
+        if biggest > MAX_STEP_DEG:
+            problems.append(f"{where} が {biggest:.0f} deg あります"
+                            f"（上限 {MAX_STEP_DEG:.0f}）")
 
         if problems:
             for problem in problems:
@@ -395,10 +420,12 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
         here = joints_of(robot)
         step = max((abs(value - here[name])
                     for name, value in point.joints.items()), default=0.0)
-        if step > MAX_STEP_DEG:
+        cap = MAX_FIRST_STEP_DEG if index == 1 else MAX_STEP_DEG
+        if step > cap:
             raise Unsafe(
                 f"waypoint {index} ({point.phase}) は現在姿勢から {step:.0f} deg "
-                f"離れています（上限 {MAX_STEP_DEG:.0f}）")
+                f"離れています（上限 {cap:.0f}）"
+                + ("。アームが想定外の場所にあります" if index == 1 else ""))
 
         seconds = max(0.4, point.seconds / max(speed, 1e-3),
                       step / (MAX_DEG_PER_SECOND * max(speed, 1e-3)))

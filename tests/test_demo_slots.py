@@ -324,3 +324,26 @@ def test_a_small_move_keeps_its_taught_duration():
     ])
     records = play(FakeRobot(POSE), trajectory, log=lambda *_: None)
     assert records[1]["seconds"] == pytest.approx(1.2)
+
+
+def test_a_big_move_between_two_taught_poses_is_allowed():
+    """Folded HOME to extended PREGRASP is 125 deg on slot 4, and legitimate."""
+    far = dict(POSE, shoulder_lift=POSE["shoulder_lift"] + 125.0)
+    trajectory = Trajectory(name="slot4", waypoints=[
+        Waypoint("HOME", dict(POSE), gripper=40.0),
+        Waypoint("PREGRASP", far, gripper=40.0),
+    ])
+    records = play(FakeRobot(POSE), trajectory, log=lambda *_: None)
+    assert len(records) == 2
+
+
+def test_the_first_waypoint_is_still_held_to_the_tighter_bound():
+    """Nothing is known about where the arm is when a run starts."""
+    from so101.demo.trajectory import MAX_FIRST_STEP_DEG
+
+    trajectory = Trajectory(name="slot4", waypoints=[
+        Waypoint("HOME", dict(POSE), gripper=40.0)])
+    stranded = {name: value + MAX_FIRST_STEP_DEG + 10.0
+                for name, value in POSE.items()}
+    with pytest.raises(Unsafe, match="想定外"):
+        play(FakeRobot(stranded), trajectory, log=lambda *_: None)
