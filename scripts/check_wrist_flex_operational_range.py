@@ -165,6 +165,16 @@ MEASURED_FLOOR_MM = 30.0
 #: pose of the path, on the gripper and on the arm as a whole, and it is what
 #: Test A is really asking.
 APPROACH_TOLERANCE_MM = 1.0
+
+#: The support stays put for the whole run - nobody reaches in to remove it once
+#: the torque is on - so the arm has to leave it and then stay away from it. At
+#: the start the distance is zero by definition: the arm is resting on the
+#: thing. So the same reasoning as the table applies, for the same reason: the
+#: criterion is the direction, not the height. Having left, it must clear this
+#: much, which is generous because the support's position is measured with a
+#: ruler by hand and its edges are where the error is.
+SUPPORT_MARGIN_MM = 20.0
+SUPPORT_TOLERANCE_MM = 1.0
 #: How much of the travel a waypoint must stay inside the servo's own limits by.
 LIMIT_MARGIN_DEG = 2.0
 #: Written into the servos' Goal_Velocity, and restored to 0 afterwards. With
@@ -400,6 +410,88 @@ def waypoints(start, goal, step_deg=STEP_DEG):
             for step in range(1, steps + 1)]
 
 
+class Support:
+    """A box standing on the table, holding the arm up while the torque is off.
+
+    It stays where it is for the whole run - nobody reaches in to take it away
+    once the torque is on - so the arm has to leave it and then keep away from
+    it, and that has to be checked against the path rather than assumed from
+    where it was put.
+
+    Axis-aligned, because a book or a block on a table is, and because two edge
+    positions and a height are what a person can actually measure.
+    """
+
+    PATH = Path("data/bench_support.json")
+
+    def __init__(self, x0, x1, y0, y1, top, label=""):
+        self.x0, self.x1 = sorted((float(x0), float(x1)))
+        self.y0, self.y1 = sorted((float(y0), float(y1)))
+        self.top = float(top)
+        self.label = label
+
+    @classmethod
+    def parse(cls, text):
+        """`x0,x1,y0,y1,top` in millimetres, in the arm's own frame."""
+        parts = [float(v) / 1000 for v in text.split(",")]
+        if len(parts) != 5:
+            raise SystemExit(
+                "\n  --support は mm で 5 つの数値です: x0,x1,y0,y1,top\n"
+                "  ベース中心を原点に、x は前方、y は左方、top は机面からの高さ。\n"
+                "  例: --support 120,220,-60,60,55\n")
+        return cls(*parts)
+
+    def distance(self, points, table_z):
+        """Smallest distance from any of `points` to the box, in metres.
+
+        Zero while something is inside it or resting on it, which is the normal
+        state at the start of a run: the arm is sitting on this thing.
+        """
+        import numpy as np
+
+        points = np.asarray(points, float).reshape(-1, 3)
+        dx = np.maximum(np.maximum(self.x0 - points[:, 0],
+                                   points[:, 0] - self.x1), 0.0)
+        dy = np.maximum(np.maximum(self.y0 - points[:, 1],
+                                   points[:, 1] - self.y1), 0.0)
+        dz = np.maximum(np.maximum(table_z - points[:, 2],
+                                   points[:, 2] - (table_z + self.top)), 0.0)
+        return float(np.sqrt(dx * dx + dy * dy + dz * dz).min())
+
+    def save(self, path=None):
+        path = Path(path or self.PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "x0_m": self.x0, "x1_m": self.x1, "y0_m": self.y0,
+            "y1_m": self.y1, "top_m": self.top, "label": self.label,
+            "written": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }, indent=2), encoding="utf-8")
+        return path
+
+    @classmethod
+    def load(cls, path=None):
+        path = Path(path or cls.PATH)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        support = cls(data["x0_m"], data["x1_m"], data["y0_m"], data["y1_m"],
+                      data["top_m"], data.get("label", ""))
+        support.written = data.get("written")
+        return support
+
+    def describe(self):
+        return (f"x {1000*self.x0:+.0f}..{1000*self.x1:+.0f}、"
+                f"y {1000*self.y0:+.0f}..{1000*self.y1:+.0f}、"
+                f"机面から高さ {1000*self.top:.0f} mm")
+
+    def as_dict(self):
+        return {"x0_mm": round(1000 * self.x0, 1),
+                "x1_mm": round(1000 * self.x1, 1),
+                "y0_mm": round(1000 * self.y0, 1),
+                "y1_mm": round(1000 * self.y1, 1),
+                "top_mm": round(1000 * self.top, 1), "label": self.label}
+
+
 class Table:
     """The table, and how far the arm is from it. One height, one simulator.
 
@@ -409,14 +501,68 @@ class Table:
     `so101.sim.table_height()` existed.
     """
 
-    def __init__(self, jaws_deg):
+    def __init__(self, jaws_deg, support=None):
         from so101.sim import SO101Sim, table_height
 
         self.z = table_height()
         self.jaws = jaws_deg
+        self.support = support
         self.sim = SO101Sim(table_z=self.z)
         self.ignore = tuple(f"block_{i}" for i in range(16)) + \
             tuple(f"block_{i}_geom" for i in range(16))
+        self._meshes = None
+
+    def _mesh_index(self):
+        """(geom index, body, vertices) for every arm mesh, worked out once."""
+        import mujoco
+
+        if self._meshes is None:
+            self._meshes = []
+            for index in range(self.sim.model.ngeom):
+                body = mujoco.mj_id2name(
+                    self.sim.model, mujoco.mjtObj.mjOBJ_BODY,
+                    self.sim.model.geom_bodyid[index])
+                if body not in MOVING_BODIES:
+                    continue
+                mesh = self.sim.model.geom_dataid[index]
+                if mesh < 0:
+                    continue
+                start = self.sim.model.mesh_vertadr[mesh]
+                count = self.sim.model.mesh_vertnum[mesh]
+                self._meshes.append(
+                    (index, body, self.sim.model.mesh_vert[start:start + count]))
+        return self._meshes
+
+    def survey(self, pose):
+        """Everything geometric about one pose, from a single pass over the meshes.
+
+        One pass rather than six: the lowest point, the gripper's own lowest
+        point and the distance to the support all want the same vertices in the
+        same world positions, and walking the meshes is the whole cost.
+        """
+        import numpy as np
+
+        self.sim.set_joints(pose, gripper_deg=self.jaws)
+        lowest, gripper_lowest = np.inf, np.inf
+        nearest = np.inf
+        for index, body, vertices in self._mesh_index():
+            world = vertices @ np.array(
+                self.sim.data.geom_xmat[index]).reshape(3, 3).T \
+                + self.sim.data.geom_xpos[index]
+            low = float(world[:, 2].min())
+            lowest = min(lowest, low)
+            if body in ("gripper", "moving_jaw_so101_v1"):
+                gripper_lowest = min(gripper_lowest, low)
+            if self.support is not None:
+                nearest = min(nearest, self.support.distance(world, self.z))
+        contacts = {f"{a}/{b}" for a, b, _ in self.sim.collisions(
+            ignore=self.ignore) if "table" not in (a, b)}
+        return {"gap": lowest - self.z, "gripper_gap": gripper_lowest - self.z,
+                "support": None if self.support is None else nearest,
+                "contacts": contacts}
+
+    def support_gap(self, pose):
+        return self.survey(pose)["support"]
 
     def gripper_gap(self, pose):
         """The gripper assembly's own clearance, whether or not it is lowest.
@@ -426,24 +572,15 @@ class Table:
         and after that the global figure stops saying anything about the part
         that can actually hit the table.
         """
-        self.sim.set_joints(pose, gripper_deg=self.jaws)
-        return min(self.sim.lowest_point(bodies=(body,))
-                   for body in ("gripper", "moving_jaw_so101_v1")) - self.z
+        return self.survey(pose)["gripper_gap"]
 
     def look(self, pose):
         """(clearance in metres, self-contacts) for a pose."""
-        # The jaws where they actually are, not where some other script opens
-        # them to: the gripper is the lowest thing here and its own angle moves
-        # it, and this run never commands the gripper at all.
-        self.sim.set_joints(pose, gripper_deg=self.jaws)
-        contacts = {f"{a}/{b}" for a, b, _ in self.sim.collisions(
-            ignore=self.ignore) if "table" not in (a, b)}
-        lowest = min(self.sim.lowest_point(bodies=(body,))
-                     for body in MOVING_BODIES)
-        return lowest - self.z, contacts
+        seen = self.survey(pose)
+        return seen["gap"], seen["contacts"]
 
     def gap(self, pose):
-        return self.look(pose)[0]
+        return self.survey(pose)["gap"]
 
 
 def sensitivities(table, start, probe_deg=2.0):
@@ -556,12 +693,31 @@ def report_liftoff(detail, liftoff, log):
         "できるまで指令しません。")
 
 
-def where(port, log):
+def resolve_support(args, log=None):
+    """The support the run should assume: the flag, the saved file, or none.
+
+    Saved rather than retyped every run, because five numbers retyped from
+    memory is a way to check the path against a support that is not the one on
+    the bench. Printed every run for the same reason.
+    """
+    if getattr(args, "no_support", False):
+        return None
+    if getattr(args, "support", None):
+        support = Support.parse(args.support)
+        support.save()
+        if log:
+            log(f"  支持物を保存しました: {Support.PATH}")
+        return support
+    return Support.load()
+
+
+def where(port, log, support=None):
     """Read-only: where the arm is and how much room it has. Repeat while lifting."""
     arm = read_arm(port)
     start = {name: arm[name]["deg"] for name in ARM_JOINTS}
-    table = Table(arm["gripper"]["deg"])
-    gap, contacts = table.look(start)
+    table = Table(arm["gripper"]["deg"], support)
+    seen = table.survey(start)
+    gap, contacts = seen["gap"], seen["contacts"]
 
     log(f"\n  TABLE_Z {1000*table.z:+.2f} mm（ベース底面）、"
         f"jaws {arm['gripper']['deg']:+.1f} deg")
@@ -594,6 +750,13 @@ def where(port, log):
         f"{CLEARANCE_WANTED_MM:.0f} mm 以上")
     if contacts:
         log(f"    自身に接触しています: {sorted(contacts)}")
+    if support is not None:
+        log(f"\n  支持物 {support.describe()}")
+        log(f"    いまのアームとの距離 {1000*seen['support']:+.1f} mm"
+            f"（0 なら乗っています）")
+        if getattr(support, "written", None):
+            log(f"    {Support.PATH} に {support.written} 付けで保存された値です。")
+            log("    実物と違っていれば --support で入れ直してください。")
     if 1000 * gap < CLEARANCE_WANTED_MM:
         log("\n  どちらへ動かせば上がるか（この姿勢で実測）:")
         rates = sensitivities(table, start)
@@ -718,9 +881,12 @@ def replay(stages, start, table, log, fine=6):
     log("    " + pad("stage", 30) + pad("種別", 9) + rpad("点", 5)
         + rpad("最小 全体", 11) + rpad("グリッパ", 11) + "   判定")
 
-    start_grip = table.gripper_gap(start)
+    opening = table.survey(start)
+    start_grip = opening["gripper_gap"]
+    start_support = opening["support"]
     tolerance = APPROACH_TOLERANCE_MM / 1000
     floor = CLEARANCE_FLOOR_MM / 1000
+    support_tolerance = SUPPORT_TOLERANCE_MM / 1000
     clear = True
     report = {"table_z_mm": round(1000 * table_z, 3),
               "clearance_floor_mm": CLEARANCE_FLOOR_MM,
@@ -731,19 +897,31 @@ def replay(stages, start, table, log, fine=6):
               "stages": []}
     for label, path, kind in stages:
         least, least_grip = float("inf"), float("inf")
+        least_support, support_closed_at = float("inf"), None
         offenders, worst_at, closed_at, below_at = set(), None, None, None
+        support_previous = start_support
         previous = dict(here)
         for target in path:
             for step in range(1, fine + 1):
                 pose = dict(here)
                 pose.update({n: previous[n] + (target[n] - previous[n])
                              * step / fine for n in target})
-                found, gap = look(pose)
-                grip = table.gripper_gap(pose)
+                seen = table.survey(pose)
+                found, gap, grip = seen["contacts"], seen["gap"], seen["gripper_gap"]
                 if gap < least:
                     least, worst_at = gap, dict(pose)
                 if grip < least_grip:
                     least_grip = grip
+                if seen["support"] is not None:
+                    near = seen["support"]
+                    least_support = min(least_support, near)
+                    # Leaving the support is allowed to start at zero - the arm
+                    # is on it - but from there the distance may only grow, and
+                    # once grown it may not come back.
+                    if support_closed_at is None \
+                            and near < support_previous - support_tolerance:
+                        support_closed_at = (dict(pose), support_previous, near)
+                    support_previous = max(support_previous, near)
                 # A transit and a sweep fail differently, and judging them
                 # alike was wrong: turning the wrist down from the posture
                 # lowers the gripper by 120 mm on purpose, and calling that
@@ -763,7 +941,9 @@ def replay(stages, start, table, log, fine=6):
             previous.update(target)
             here.update(target)
 
-        ok = not offenders and closed_at is None and below_at is None
+        support_ok = support_closed_at is None
+        ok = (not offenders and closed_at is None and below_at is None
+              and support_ok)
         verdict = ("机へ近づきません" if kind == "transit"
                    else f"{CLEARANCE_FLOOR_MM:.0f} mm を保ちます")
         log(f"    {pad(label, 30)}{pad(kind, 9)}{len(path):>5}"
@@ -773,6 +953,10 @@ def replay(stages, start, table, log, fine=6):
             "stage": label, "kind": kind, "waypoints": len(path),
             "min_clearance_mm": round(1000 * least, 2),
             "min_gripper_clearance_mm": round(1000 * least_grip, 2),
+            "min_support_distance_mm": (None if table.support is None
+                                        else round(1000 * least_support, 2)),
+            "never_returns_to_support": None if table.support is None
+                                        else support_ok,
             "never_approaches": None if kind != "transit" else closed_at is None,
             "above_floor": None if kind == "transit" else below_at is None,
             "no_new_contacts": not offenders, "ok": bool(ok)})
@@ -785,6 +969,12 @@ def replay(stages, start, table, log, fine=6):
                 f"{1000*gap:+.1f} mm、グリッパ {1000*grip:+.1f} mm。そのときの姿勢:")
             log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
             clear = False
+        if support_closed_at is not None:
+            pose, before, after = support_closed_at
+            log(f"      支持物へ戻ります（{1000*before:.1f} → {1000*after:.1f} mm）。"
+                f"そのときの姿勢:")
+            log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
+            clear = False
         if closed_at is not None:
             pose, gap, grip = closed_at
             log(f"      机へ近づきます: 全体 {1000*parked:+.1f} → "
@@ -793,6 +983,17 @@ def replay(stages, start, table, log, fine=6):
             log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
             clear = False
 
+    if table.support is not None:
+        report["support"] = table.support.as_dict()
+        report["start_support_distance_mm"] = round(1000 * start_support, 2)
+        report["min_support_distance_mm"] = min(
+            s["min_support_distance_mm"] for s in report["stages"])
+        report["support_margin_mm"] = SUPPORT_MARGIN_MM
+        ends = table.survey({**start, **stages[-1][1][-1]})["support"]
+        report["end_support_distance_mm"] = round(1000 * ends, 2)
+        report["leaves_support"] = bool(1000 * ends >= SUPPORT_MARGIN_MM)
+        if not report["leaves_support"]:
+            clear = False
     report["min_clearance_mm"] = min(s["min_clearance_mm"]
                                      for s in report["stages"])
     report["min_gripper_clearance_mm"] = min(s["min_gripper_clearance_mm"]
@@ -805,6 +1006,15 @@ def replay(stages, start, table, log, fine=6):
     log(f"    開始時からの悪化   "
         + ("なし（どの姿勢でも机へ近づきません）"
            if report["never_approaches"] else "*** あり ***"))
+    if table.support is not None:
+        log(f"\n    支持物 {table.support.describe()}")
+        log(f"      開始時の距離     {report['start_support_distance_mm']:+.1f} mm"
+            f"（0 なら乗っています）")
+        log(f"      経路中の最小     {report['min_support_distance_mm']:+.1f} mm")
+        log(f"      終了時の距離     {report['end_support_distance_mm']:+.1f} mm"
+            f"   要求 {SUPPORT_MARGIN_MM:.0f} mm 以上   "
+            f"{'OK' if report['leaves_support'] else '*** 不足 ***'}")
+        log("      判定は「離れたあと戻らないこと」と「最後に離れていること」です。")
     return clear, report
 
 
@@ -1353,6 +1563,14 @@ def main():
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
     parser.add_argument("--posture-only", action="store_true",
                         help="姿勢へ行って到達を確認し、戻るだけ。手首は振りません")
+    parser.add_argument("--support", metavar="x0,x1,y0,y1,top",
+                        help="机に置いたままにする支持物の箱を mm で。"
+                             "ベース中心が原点、x は前方、y は左方、"
+                             "top は机面からの高さ。例: 120,220,-60,60,55。"
+                             f"一度渡すと {Support.PATH} に保存され、"
+                             "次回以降は自動で読み込みます")
+    parser.add_argument("--no-support", action="store_true",
+                        help="保存された支持物を無視します（撤去した場合）")
     parser.add_argument("--measured-clearance", type=float, metavar="MM",
                         help="定規で実測した、グリッパ最下点から机までの mm。"
                              "開始条件の判定にだけ使います。モデルの干渉判定を"
@@ -1372,9 +1590,10 @@ def main():
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
+    support = resolve_support(args, Log() if args.where else None)
     if args.where:
         from so101.hardware import resolve as resolve_port
-        where(resolve_port([args.follower_port])[0], Log())
+        where(resolve_port([args.follower_port])[0], Log(), support)
         return
     if args.posture_only:
         args.to = 0.0
@@ -1409,7 +1628,13 @@ def main():
         arm = read_arm(port)
         posture = POSTURES[args.posture]
         start = {name: arm[name]["deg"] for name in ARM_JOINTS}
-        table = Table(arm["gripper"]["deg"])
+        table = Table(arm["gripper"]["deg"], support)
+        if support is not None:
+            log(f"\n  支持物: {support.describe()}")
+            log("  置いたまま実行します。トルク ON 後に手を入れて取り除く運用は")
+            log("  しません。全 waypoint の掃引体積との距離を下で検査します。")
+        else:
+            log("\n  支持物: 設定されていません（--support で指定できます）")
 
         log("\n  --- ここから机までの余裕を、いまの姿勢について測ります ---")
         liftoff, detail = plan_liftoff(table, start, dict(posture,
@@ -1452,6 +1677,12 @@ def main():
         if args.dry_run:
             log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
+        if support is not None and not clearance.get("leaves_support", True):
+            raise SystemExit(
+                f"\n  経路の終わりで支持物まで "
+                f"{clearance['end_support_distance_mm']:.1f} mm しかありません"
+                f"（要求 {SUPPORT_MARGIN_MM:.0f} mm）。\n"
+                "  支持物を動かすか、置き方を変えてください。\n")
         if not shape_ok:
             raise SystemExit(
                 "\n  waypoint 列が不連続です。実行を拒否します。\n")
@@ -1479,10 +1710,12 @@ def main():
             raise SystemExit(
                 "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
 
-        run(args, arm, posture, stages, port, out_dir, log, clearance)
+        run(args, arm, posture, stages, port, out_dir, log, clearance,
+            support)
 
 
-def run(args, arm, posture, stages, port, out_dir, log, clearance):
+def run(args, arm, posture, stages, port, out_dir, log, clearance,
+        support=None):
     """Everything from here on moves the arm."""
     import numpy as np  # noqa: F401 - summarise needs it; fail early if absent
 
@@ -1576,6 +1809,7 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance):
             "fps": FPS, "p_coefficient": tuning.p_coefficient(),
         },
         "git": git_state(), "clearance": clearance,
+        "support": None if support is None else support.as_dict(),
         "arrivals": [], "holds": [],
     }
 
