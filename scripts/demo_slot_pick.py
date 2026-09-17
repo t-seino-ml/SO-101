@@ -255,7 +255,8 @@ def main():
         log("\n  接続しました。トルクが入っています。")
         began = time.perf_counter()
         record["waypoints"] = play(robot, trajectory, log=log,
-                                   speed=args.speed, confirm=confirm)
+                                   speed=args.speed, confirm=confirm,
+                                   limits=limits)
         record["seconds"] = round(time.perf_counter() - began, 1)
         record["outcome"] = "done"
         log(f"\n  完了しました（{record['seconds']:.1f} 秒）")

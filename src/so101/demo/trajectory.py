@@ -37,11 +37,27 @@ PHASES = ("HOME", "PREGRASP", "GRASP", "CLOSE", "LIFT", "TRANSFER",
 
 DEFAULT_SECONDS = 2.0
 DEFAULT_SETTLE_S = 0.35
-#: Within this of a waypoint counts as reached. The servos settle a few tenths
-#: short under gravity with no integral term; demanding much less would be
-#: demanding something the hardware does not do.
+#: Within this of a waypoint counts as reached, *after* the sag has been
+#: corrected for. Commanding a joint angle does not produce that joint angle:
+#: the follower settles short under its own weight, with no integral term to
+#: close the gap - `so101.policy.motion` says the same thing about Cartesian
+#: moves and measured most of a centimetre. Measured here: elbow_flex 2.6 deg
+#: short at PREGRASP, arm extended forward.
 ARRIVE_DEG = 1.5
 ARRIVE_TIMEOUT_S = 4.0
+#: How many times to aim again, adding the miss back into the command.
+#:
+#: This is not only about passing the check. Teaching recorded what the follower
+#: *measured* while the leader drove it, which was already one sag below what
+#: the leader asked for. Replaying that number sags again, so the arm arrives a
+#: sag lower than the pose that was taught and watched working - and at GRASP
+#: that is the difference between the jaws going round the block and onto it.
+SETTLE_ROUNDS = 3
+SETTLE_SECONDS = 0.45
+#: The correction may not wander further than this from the taught angle. A
+#: joint held by something is not short because it sagged, and adding its error
+#: back round after round would just lean on whatever is stopping it.
+MAX_CORRECTION_DEG = 8.0
 #: Of 1023. `so101.policy.motion` aborts at 700; this is lower because a taught
 #: trajectory should meet nothing at all - anything it does meet is a surprise.
 LOAD_ABORT = 450
@@ -272,8 +288,18 @@ def freeze(robot, log=print):
 # playing
 # -------------------------------------------------------------------------
 
+def _clamp(value, taught, limit):
+    """A corrected command, kept near the taught angle and inside the servo."""
+    low = taught - MAX_CORRECTION_DEG
+    high = taught + MAX_CORRECTION_DEG
+    if limit is not None:
+        low = max(low, limit["min_deg"] + 1.0)
+        high = min(high, limit["max_deg"] - 1.0)
+    return max(low, min(high, value))
+
+
 def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
-         arrive_deg=ARRIVE_DEG, confirm=None):
+         arrive_deg=ARRIVE_DEG, confirm=None, limits=None):
     """Replay a taught trajectory, watching the arm the whole way.
 
     Returns a list of per-waypoint records. Raises Unsafe on anything that
@@ -282,6 +308,10 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
     `confirm` is called before each waypoint with the waypoint; returning False
     stops the run cleanly. Used for the first cautious replays and left out once
     a trajectory is trusted.
+
+    `limits` is what `read_limits` returned, so a sag correction cannot walk a
+    command outside the servo's own stops. Optional, and only because the
+    correction is already capped at MAX_CORRECTION_DEG from the taught angle.
     """
     from ..policy.motion import glide_to
 
@@ -306,8 +336,12 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
         glide_to(robot, point.command(), seconds=seconds, fps=FPS)
         time.sleep(point.settle_s)
 
-        # Did it arrive, and did anything object on the way?
-        deadline = time.perf_counter() + ARRIVE_TIMEOUT_S
+        # Aim, look at where it actually went, and add the miss back into the
+        # aim. A couple of rounds of that and the joint is where it was taught,
+        # rather than a sag below it.
+        aim = dict(point.joints)
+        corrections = 0
+        previous_worst = None
         while True:
             reached = joints_of(robot)
             errors = {name: reached[name] - value
@@ -322,12 +356,33 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
                 raise Unsafe(f"{point.phase}: 温度 {temperature} C")
             if abs(errors[worst]) <= arrive_deg:
                 break
-            if time.perf_counter() > deadline:
+            if corrections >= SETTLE_ROUNDS:
                 raise Unsafe(
-                    f"{point.phase}: {ARRIVE_TIMEOUT_S:.0f} s 以内に到達せず。"
+                    f"{point.phase}: {corrections} 回補正しても到達せず。"
                     f"{worst} が {errors[worst]:+.2f} deg ずれ"
                     f"（許容 {arrive_deg:.1f}）")
-            time.sleep(0.05)
+            # Not shrinking means something is holding it, and leaning harder on
+            # that is the wrong answer.
+            if previous_worst is not None \
+                    and abs(errors[worst]) > previous_worst - 0.2:
+                raise Unsafe(
+                    f"{point.phase}: 補正しても誤差が縮みません"
+                    f"（{previous_worst:.2f} → {abs(errors[worst]):.2f} deg）。"
+                    f"{worst} が何かに当たっている可能性があります")
+            previous_worst = abs(errors[worst])
+
+            corrections += 1
+            aim = {name: _clamp(value - errors[name], point.joints[name],
+                                limits.get(name) if limits else None)
+                   for name, value in aim.items()}
+            log(f"      補正 {corrections}/{SETTLE_ROUNDS}: {worst} が "
+                f"{errors[worst]:+.2f} deg 手前 → 指令を "
+                f"{aim[worst] - point.joints[worst]:+.2f} deg ずらします")
+            command = dict(aim)
+            if point.gripper is not None:
+                command["gripper"] = point.gripper
+            glide_to(robot, command, seconds=SETTLE_SECONDS, fps=FPS)
+            time.sleep(point.settle_s)
 
         record = {
             "index": index, "phase": point.phase,
@@ -335,6 +390,9 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             "reached": {n: round(reached[n], 2) for n in point.joints},
             "worst_joint": worst,
             "worst_error_deg": round(errors[worst], 2),
+            "corrections": corrections,
+            "commanded_after_correction": {n: round(v, 2)
+                                           for n, v in aim.items()},
             "gripper_deg": round(reached.get("gripper", 0.0), 2),
             "load": load, "load_joint": hot_joint,
             "temperature_c": temperature,
@@ -343,7 +401,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
         }
         records.append(record)
         log(f"      到達 {worst} {errors[worst]:+.2f} deg、負荷 {load}"
-            f"（{hot_joint}）、{temperature} C")
+            f"（{hot_joint}）、{temperature} C"
+            + (f"、補正 {corrections} 回" if corrections else ""))
         if on_sample is not None:
             on_sample(record)
     return records

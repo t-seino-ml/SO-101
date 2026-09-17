@@ -109,21 +109,38 @@ class FakeBus:
 
 
 class FakeRobot:
-    """Goes where it is told. `lag` leaves it short, as a stuck joint would."""
+    """Goes exactly where it is told."""
 
-    def __init__(self, pose, lag=0.0, load=30):
+    def __init__(self, pose, load=30):
         self.pose = dict(pose, gripper=40.0)
         self.bus = FakeBus(self, load)
-        self.lag = lag
 
     def get_observation(self):
         return {f"{name}.pos": value for name, value in self.pose.items()}
 
     def send_action(self, action):
         for key, value in action.items():
+            self.pose[key.removesuffix(".pos")] = float(value)
+        return dict(action)
+
+
+class BlockedRobot(FakeRobot):
+    """A joint that meets something and cannot go past it, whatever is asked.
+
+    Distinct from sagging on purpose, because the two look identical for one
+    sample and must be handled oppositely: a sag closes when you aim past it, an
+    obstacle does not, and aiming further at an obstacle is leaning on it.
+    """
+
+    def __init__(self, pose, joint="elbow_flex", stops_at=85.0, load=30):
+        super().__init__(pose, load)
+        self.joint, self.stops_at = joint, stops_at
+
+    def send_action(self, action):
+        for key, value in action.items():
             name = key.removesuffix(".pos")
-            self.pose[name] = float(value) - (self.lag if name in ARM_JOINTS
-                                              else 0.0)
+            self.pose[name] = (max(float(value), self.stops_at)
+                               if name == self.joint else float(value))
         return dict(action)
 
 
@@ -145,9 +162,9 @@ def test_play_walks_the_whole_trajectory():
 
 def test_play_stops_when_a_waypoint_is_not_reached():
     """A joint that will not arrive is the fault; it must not carry on."""
-    robot = FakeRobot(POSE, lag=9.0)
-    with pytest.raises(Unsafe, match="到達"):
-        play(robot, _trajectory(shoulder_pan=12.0), log=lambda *_: None)
+    robot = BlockedRobot(POSE, stops_at=85.0)
+    with pytest.raises(Unsafe):
+        play(robot, _trajectory(elbow_flex=60.0), log=lambda *_: None)
 
 
 def test_play_stops_on_load():
@@ -163,3 +180,45 @@ def test_play_refuses_a_waypoint_miles_from_the_arm():
                           for name, value in POSE.items()}, gripper=40.0)])
     with pytest.raises(Unsafe, match="離れて"):
         play(robot, wild, log=lambda *_: None)
+
+
+class SaggingRobot(FakeRobot):
+    """Arrives a fixed amount short, like the real one under its own weight.
+
+    The sag is against the *command*, so aiming past the target closes it -
+    which is the thing being tested. A joint held by something would not behave
+    like this, and `test_play_stops_when_a_waypoint_is_not_reached` covers that.
+    """
+
+    def __init__(self, pose, sag=2.6, joint="elbow_flex"):
+        super().__init__(pose)
+        self.sag, self.joint = sag, joint
+
+    def send_action(self, action):
+        for key, value in action.items():
+            name = key.removesuffix(".pos")
+            self.pose[name] = float(value) - (self.sag if name == self.joint
+                                              else 0.0)
+        return dict(action)
+
+
+def test_play_corrects_the_sag_rather_than_accepting_it():
+    """2.6 deg short at PREGRASP was a real abort, and the fix is to aim past."""
+    robot = SaggingRobot(POSE)
+    records = play(robot, _trajectory(elbow_flex=60.0), log=lambda *_: None)
+
+    assert records[-1]["corrections"] >= 1, "it should have aimed again"
+    assert abs(records[-1]["worst_error_deg"]) <= 1.5
+    assert robot.pose["elbow_flex"] == pytest.approx(60.0, abs=0.5), \
+        "the arm must end at the taught angle, not a sag below it"
+    # And the correction is where it belongs: in the command, not the record of
+    # what was taught.
+    assert records[-1]["commanded_after_correction"]["elbow_flex"] > 60.0
+
+
+def test_the_correction_gives_up_rather_than_leaning_on_something():
+    """A joint held by an obstacle is not sagging, and must not be pushed."""
+    robot = BlockedRobot(POSE, stops_at=85.0)
+    with pytest.raises(Unsafe, match="縮みません"):
+        play(robot, _trajectory(elbow_flex=60.0), log=lambda *_: None)
+    assert robot.pose["elbow_flex"] == pytest.approx(85.0),         "it must have stopped at the obstacle, not pushed past it"
