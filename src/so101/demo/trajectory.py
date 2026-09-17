@@ -36,6 +36,16 @@ PHASES = ("HOME", "PREGRASP", "GRASP", "CLOSE", "LIFT", "TRANSFER",
           "CAN_ABOVE", "DROP", "OPEN", "RETURN")
 
 DEFAULT_SECONDS = 2.0
+#: No move goes faster than this, whatever the taught duration says.
+#:
+#: The taught seconds come from a table keyed on the phase name, and a phase
+#: name is whatever the operator pressed ENTER at. Teaching slot 2 went one
+#: phase early throughout, which left an 89 degree return home carrying DROP's
+#: one second - 89 deg/s. The motion was right and the label was wrong, and a
+#: duration should not depend on a label. So it is taken from the distance, and
+#: the taught value becomes a floor rather than the answer. 30 deg/s is what
+#: slot 1 already ran at.
+MAX_DEG_PER_SECOND = 30.0
 DEFAULT_SETTLE_S = 0.35
 #: Within this of a waypoint counts as reached, *after* the sag has been
 #: corrected for. Commanding a joint angle does not produce that joint angle:
@@ -390,7 +400,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
                 f"waypoint {index} ({point.phase}) は現在姿勢から {step:.0f} deg "
                 f"離れています（上限 {MAX_STEP_DEG:.0f}）")
 
-        seconds = max(0.4, point.seconds / max(speed, 1e-3))
+        seconds = max(0.4, point.seconds / max(speed, 1e-3),
+                      step / (MAX_DEG_PER_SECOND * max(speed, 1e-3)))
         log(f"  [{index}/{len(trajectory.waypoints)}] {point.phase:<10} "
             f"最大 {step:5.1f} deg を {seconds:.1f} s"
             + ("" if grip is None else
@@ -470,6 +481,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             "load": load, "load_joint": hot_joint, "gripper_load": grip_load,
             "temperature_c": temperature,
             "seconds": round(seconds, 2),
+            "taught_seconds": point.seconds,
+            "deg_per_second": round(step / seconds, 1) if seconds else 0.0,
             "at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         }
         # Did anything end up between the jaws? Only asked where the jaws were

@@ -299,3 +299,28 @@ def test_an_arm_joint_under_load_still_stops_the_run():
     robot = FakeRobot(POSE, load=900)
     with pytest.raises(Unsafe, match="アーム"):
         play(robot, _trajectory(shoulder_pan=12.0), log=lambda *_: None)
+
+
+def test_a_big_move_is_given_time_whatever_the_taught_duration_says():
+    """Teaching slot 2 went a phase early: an 89 deg return carried DROP's 1 s."""
+    from so101.demo.trajectory import MAX_DEG_PER_SECOND
+
+    far = dict(POSE, shoulder_lift=POSE["shoulder_lift"] + 89.0)
+    trajectory = Trajectory(name="slot2", waypoints=[
+        Waypoint("HOME", dict(POSE), gripper=40.0, seconds=3.0),
+        Waypoint("DROP", far, gripper=40.0, seconds=1.0),   # mislabelled
+    ])
+    records = play(FakeRobot(POSE), trajectory, log=lambda *_: None)
+    assert records[1]["seconds"] > records[1]["taught_seconds"]
+    assert records[1]["deg_per_second"] <= MAX_DEG_PER_SECOND + 0.5
+
+
+def test_a_small_move_keeps_its_taught_duration():
+    """The cap is a ceiling, not a rewrite: slow taught moves stay slow."""
+    trajectory = Trajectory(name="slot1", waypoints=[
+        Waypoint("HOME", dict(POSE), gripper=40.0, seconds=3.0),
+        Waypoint("CLOSE", dict(POSE, shoulder_pan=1.0), gripper=40.0,
+                 seconds=1.2),
+    ])
+    records = play(FakeRobot(POSE), trajectory, log=lambda *_: None)
+    assert records[1]["seconds"] == pytest.approx(1.2)
