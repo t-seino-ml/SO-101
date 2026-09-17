@@ -96,10 +96,10 @@ def drive_until_enter(robot, teleop, label, hint, fps=60):
         started = time.perf_counter()
         robot.send_action(teleop.get_action())
         pose = joints_of(robot)
-        load, where, temperature = health(robot)
+        load, where, temperature, grip = health(robot)
         print("    " + "  ".join(f"{n[:5]}{pose[n]:+7.1f}" for n in ARM_JOINTS)
               + f"  grip{pose.get('gripper', 0):+6.1f}"
-              + f"   負荷 {load:>4}({where or '-'})  {temperature}C   ",
+              + f"   腕 {load:>4}({where or '-'})  顎 {grip:>4}  {temperature}C   ",
               end="", flush=True)
         if enter_pressed():
             print()

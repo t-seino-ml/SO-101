@@ -269,3 +269,33 @@ def test_a_block_between_the_jaws_reads_as_held():
     records = play(Holding(POSE), _pick(), log=lambda *_: None)
     assert records[3]["grasped"] is True
     assert records[3]["grip_margin_deg"] == pytest.approx(15.0, abs=0.1)
+
+
+def test_a_gripped_block_is_not_mistaken_for_a_crash():
+    """A firm grip pins the gripper's load. That is success, not a fault."""
+    class Gripping(FakeRobot):
+        def __init__(self, pose):
+            super().__init__(pose)
+            self.bus.read = self._read
+
+        def _read(self, register, motor, normalize=True, num_retry=0):
+            if register == "Present_Load":
+                return 500 if motor == "gripper" else 30
+            return 40
+
+        def send_action(self, action):
+            super().send_action(action)
+            self.pose["gripper"] = max(self.pose["gripper"], 25.6)
+            return dict(action)
+
+    records = play(Gripping(POSE), _pick(), log=lambda *_: None)
+    assert records[3]["grasped"] is True
+    assert records[3]["gripper_load"] == 500
+    assert records[3]["load"] == 30, "the arm's load is reported on its own"
+
+
+def test_an_arm_joint_under_load_still_stops_the_run():
+    """Excluding the gripper must not have excluded everything."""
+    robot = FakeRobot(POSE, load=900)
+    with pytest.raises(Unsafe, match="アーム"):
+        play(robot, _trajectory(shoulder_pan=12.0), log=lambda *_: None)

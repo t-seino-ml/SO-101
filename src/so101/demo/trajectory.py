@@ -78,8 +78,16 @@ GRIP_EVENT_DEG = 5.0
 #: closed on air.
 HOLDING_MARGIN_DEG = 4.0
 
-#: Of 1023. `so101.policy.motion` aborts at 700; this is lower because a taught
-#: trajectory should meet nothing at all - anything it does meet is a surprise.
+#: Of 1023, and for the arm joints only. `so101.policy.motion` aborts at 700;
+#: this is lower because a taught trajectory should meet nothing at all -
+#: anything an *arm* joint meets is a surprise.
+#:
+#: The gripper is not in that list, and must not be. It is supposed to push: a
+#: grip is a joint held away from its goal by the thing it is holding, so a
+#: firm grip reads as a pinned load by definition - measured at 500, which is
+#: the gripper's own Max_Torque_Limit. LeRobot sets that, along with
+#: Protection_Current 250 and Overload_Torque 25%, specifically so the jaws can
+#: be squeezed without being burnt out. Aborting on it aborted on success.
 LOAD_ABORT = 450
 TEMPERATURE_ABORT_C = 55
 #: Nothing may be commanded further than this from where the arm is. A taught
@@ -266,19 +274,26 @@ def joints_of(robot):
             if key.endswith(".pos")}
 
 
-def health(robot, joint=None):
-    """(worst |load|, its joint, worst temperature) across the arm."""
-    load, where, temperature = 0, None, 0
-    for name in (*ARM_JOINTS, "gripper") if joint is None else (joint,):
+def health(robot):
+    """(worst arm |load|, its joint, worst temperature, gripper |load|).
+
+    The gripper's load is returned beside the arm's rather than among it,
+    because the two mean opposite things. An arm joint under load has met
+    something it should not have; the gripper under load is holding the block.
+    """
+    load, where, temperature, grip = 0, None, 0, 0
+    for name in (*ARM_JOINTS, "gripper"):
         try:
             value = abs(robot.bus.read("Present_Load", name, normalize=False))
-            if value > load:
-                load, where = value, name
             temperature = max(temperature, robot.bus.read(
                 "Present_Temperature", name, normalize=False))
         except Exception:  # noqa: BLE001 - a dropped packet is not a fault
             continue
-    return load, where, temperature
+        if name == "gripper":
+            grip = value
+        elif value > load:
+            load, where = value, name
+    return load, where, temperature, grip
 
 
 def freeze(robot, log=print):
@@ -403,11 +418,11 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             errors = {name: reached[name] - value
                       for name, value in point.joints.items()}
             worst = max(errors, key=lambda n: abs(errors[n]))
-            load, hot_joint, temperature = health(robot)
+            load, hot_joint, temperature, grip_load = health(robot)
             if load > LOAD_ABORT:
                 raise Unsafe(
-                    f"{point.phase}: {hot_joint} の負荷 {load} が "
-                    f"{LOAD_ABORT} を超えました")
+                    f"{point.phase}: アームの {hot_joint} の負荷 {load} が "
+                    f"{LOAD_ABORT} を超えました（グリッパは別枠です）")
             if temperature > TEMPERATURE_ABORT_C:
                 raise Unsafe(f"{point.phase}: 温度 {temperature} C")
             if abs(errors[worst]) <= arrive_deg:
@@ -452,7 +467,7 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             "gripper_taught_deg": point.gripper,
             "gripper_commanded_deg": None if grip is None else round(grip, 2),
             "gripper_reached_deg": round(reached.get("gripper", 0.0), 2),
-            "load": load, "load_joint": hot_joint,
+            "load": load, "load_joint": hot_joint, "gripper_load": grip_load,
             "temperature_c": temperature,
             "seconds": round(seconds, 2),
             "at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -472,8 +487,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
                 log("      ブロックが Slot にあるか、位置がずれていないか"
                     "確認してください。")
         records.append(record)
-        log(f"      到達 {worst} {errors[worst]:+.2f} deg、負荷 {load}"
-            f"（{hot_joint}）、{temperature} C"
+        log(f"      到達 {worst} {errors[worst]:+.2f} deg、アーム負荷 {load}"
+            f"（{hot_joint}）、顎 {grip_load}、{temperature} C"
             + (f"、補正 {corrections} 回" if corrections else ""))
         if on_sample is not None:
             on_sample(record)
