@@ -244,9 +244,15 @@ def main():
                 joints={n: round(pose[n], 3) for n in ARM_JOINTS},
                 gripper=round(pose.get("gripper", 0.0), 3),
                 seconds=seconds))
-            print(f"    {phase} を記録しました")
+            print(f"    {phase} を記録: "
+                  + "  ".join(f"{SHORT[n]} {pose[n]:+.1f}" for n in ARM_JOINTS)
+                  + f"  grip {pose.get('gripper', 0.0):+.1f}")
     except KeyboardInterrupt:
         print("\n  中止しました。ここまでの waypoint は保存します。")
+    except Exception as error:  # noqa: BLE001 - keep whatever was already taught
+        # Losing eight waypoints to one bad packet is the expensive outcome.
+        print(f"\n  *** {type(error).__name__}: {error} ***")
+        print("  ここまでの waypoint は保存します。続きは教示し直してください。")
     finally:
         try:
             teleop.disconnect()
