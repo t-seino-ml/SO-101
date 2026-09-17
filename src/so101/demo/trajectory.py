@@ -78,11 +78,23 @@ MAX_CORRECTION_DEG = 8.0
 #: block stops the jaws"; the gripper's own Max_Torque_Limit and
 #: Protection_Current are set low by LeRobot precisely so this is safe.
 SQUEEZE_DEG = 15.0
-#: A change in the taught gripper angle bigger than this is a close or an open,
-#: rather than the jaws drifting a few tenths between poses. Read from the
-#: taught numbers rather than from phase names, so a trajectory that closes
-#: somewhere unusual still squeezes there.
+#: A drop in the taught gripper angle bigger than this is a close, rather than
+#: the jaws drifting a few tenths between poses.
 GRIP_EVENT_DEG = 5.0
+#: And the squeeze is held only while the taught angle stays this near where it
+#: closed. Anything else is a release.
+#:
+#: Detecting the release as "a rise bigger than GRIP_EVENT_DEG" very nearly
+#: broke the demonstration: slot 5 was taught closing at 24 and opening at 29,
+#: a rise of exactly 5.0, which is not bigger than 5.0. The jaws were commanded
+#: 14 at DROP - below where the block was - so they never opened, carried the
+#: block home, and squeezed for 27 seconds until the servo tripped its overload
+#: protection. Comparing against where it closed cannot fail that way: the
+#: question is whether the jaws are still where the block put them.
+HOLD_TOLERANCE_DEG = 2.0
+#: Phases that never hold, whatever the taught numbers say. A belt to the
+#: braces above: releasing is the one thing that must not be missed.
+RELEASING_PHASES = ("DROP", "OPEN", "RETURN", "HOME")
 #: Once squeezing, the jaws should end up this much wider than they were told -
 #: because something is between them. If they arrive where they were sent, they
 #: closed on air.
@@ -366,16 +378,18 @@ def squeeze_plan(trajectory, squeeze_deg=SQUEEZE_DEG, gripper_min=None):
     detected from the taught numbers, and every waypoint after it is squeezed
     too until an open undoes it.
     """
-    out, holding, previous = [], False, None
+    out, closed_at, previous = [], None, None
     for point in trajectory.waypoints:
         if point.gripper is None:
             out.append(None)
             continue
-        if previous is not None:
-            if point.gripper < previous - GRIP_EVENT_DEG:
-                holding = True
-            elif point.gripper > previous + GRIP_EVENT_DEG:
-                holding = False
+        if previous is not None and point.gripper < previous - GRIP_EVENT_DEG:
+            closed_at = point.gripper
+        holding = (closed_at is not None
+                   and abs(point.gripper - closed_at) <= HOLD_TOLERANCE_DEG
+                   and point.phase.upper() not in RELEASING_PHASES)
+        if not holding:
+            closed_at = None
         value = point.gripper - squeeze_deg if holding else point.gripper
         if gripper_min is not None:
             value = max(value, gripper_min)

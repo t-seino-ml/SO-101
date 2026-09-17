@@ -347,3 +347,39 @@ def test_the_first_waypoint_is_still_held_to_the_tighter_bound():
                 for name, value in POSE.items()}
     with pytest.raises(Unsafe, match="想定外"):
         play(FakeRobot(stranded), trajectory, log=lambda *_: None)
+
+
+def test_a_small_taught_opening_still_releases():
+    """Slot 5 closed at 24 and opened at 29 - a rise of exactly 5.0.
+
+    Detecting the release as "a rise bigger than 5" missed it by nothing at all,
+    squeezed the jaws shut through DROP and RETURN, and tripped the gripper's
+    overload protection 27 seconds later.
+    """
+    from so101.demo.trajectory import squeeze_plan
+
+    grips = [39.0, 39.0, 39.0, 24.0, 24.0, 24.0, 29.0]
+    names = ["HOME", "PREGRASP", "GRASP", "CLOSE", "LIFT", "CAN_ABOVE", "DROP"]
+    trajectory = Trajectory(name="slot5", waypoints=[
+        Waypoint(name, dict(POSE), gripper=grip)
+        for name, grip in zip(names, grips)])
+
+    plan = squeeze_plan(trajectory)
+    assert plan[3] < 24.0, "CLOSE still squeezes"
+    assert plan[6] == 29.0, "DROP must command the taught opening, not a squeeze"
+
+
+def test_a_releasing_phase_never_squeezes():
+    """Belt to the braces: releasing is the one thing that must not be missed."""
+    from so101.demo.trajectory import squeeze_plan
+
+    # Taught identically at CLOSE and DROP, which no comparison of the numbers
+    # alone could tell apart.
+    names = ["GRASP", "CLOSE", "LIFT", "DROP"]
+    grips = [40.0, 25.0, 25.0, 25.0]
+    trajectory = Trajectory(name="odd", waypoints=[
+        Waypoint(name, dict(POSE), gripper=grip)
+        for name, grip in zip(names, grips)])
+    plan = squeeze_plan(trajectory)
+    assert plan[1] < 25.0 and plan[2] < 25.0, "CLOSE and LIFT hold"
+    assert plan[3] == 25.0, "DROP does not, whatever the numbers say"
