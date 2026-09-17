@@ -45,7 +45,7 @@ from so101.policy.ik_policy import (
     tool_axis,
 )
 from so101.policy.tcp import ToolKinematics
-from so101.sim import BLOCK_SIZE_M, SO101Sim
+from so101.sim import BLOCK_SIZE_M, SO101Sim, table_height
 
 LIMIT_MARGIN_DEG = 8.0        # closer than this to a stop counts as marginal
 AXIS_TOLERANCE_DEG = 2.0
@@ -109,16 +109,15 @@ def main():
     limits = arm.joint_limits_deg()
     print(f"  {arm}")
 
-    # The table's height, from the one real measurement that bears on it: a
-    # grip recorded with the gripper frame at z=-8 mm, plus where the TCP sits
-    # below that frame. Still the loosest number in the model.
-    if args.table_z is None:
-        drop = arm.pose(PREFERRED)[0][2] - arm.gripper_frame(PREFERRED)[2]
-        table_z = -0.008 + drop - BLOCK_SIZE_M / 2
-        print(f"  the TCP sits {1000*drop:+.1f} mm below the gripper frame here, "
-              f"so the table is at {1000*table_z:+.1f} mm")
-    else:
-        table_z = args.table_z
+    # The table's height, from the one place it now comes from. This used to
+    # derive its own figure - the old homography's -8 mm gripper-frame height,
+    # plus the TCP's offset below that frame, minus half a block - which put the
+    # table somewhere between -1 and -15 mm depending on what data/tcp.json said
+    # that week. A workspace map and a clearance check that disagree about where
+    # the table is are not measuring the same thing.
+    table_z = table_height() if args.table_z is None else args.table_z
+    print(f"  table at {1000*table_z:+.1f} mm "
+          f"({'the underside of the base' if args.table_z is None else 'given'})")
     z = table_z + BLOCK_SIZE_M / 2
     print(f"  grasping a 20 mm block: TCP at z={1000*z:+.1f} mm\n")
 

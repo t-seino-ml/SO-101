@@ -11,16 +11,14 @@ The scene is written as MJCF text and composed with the robot at load time rathe
 than kept as a file on disk. Block and can positions change every experiment, and
 a scene that is regenerated from numbers cannot fall out of step with them.
 
-Two measurements are real and one is not yet:
+Everything here is measured. Blocks are 20 mm cubes and the can is 85 mm across
+and 35 mm tall, both from the bench; the table's height comes from
+`table_height()` below, and that function is the only place it comes from.
 
-- blocks are 20 mm cubes and the can is 85 mm across and 35 mm tall, both from
-  the bench.
-- the table's height in the arm's frame is NOT known. `data/table_frame.json`
-  records z = -0.008 m, but that is the height of the *gripper frame* when a
-  block held in the jaws rests on the table, which is a different thing by
-  however far the jaws sit from that frame - the very offset Phase S2 exists to
-  pin down. Until then `table_z` is a parameter with a provisional default, and
-  nothing here should be read as measuring it.
+That last point is the one worth being firm about. Four different table heights
+were in circulation at once - -8.5, -20, -15.3 and -2.4 mm - and a clearance
+means nothing until it says which of them it was measured against. See
+`table_height` for what each of them was and why only one of them is a table.
 """
 
 from __future__ import annotations
@@ -35,8 +33,44 @@ BLOCK_SIZE_M = 0.020          # 20 mm cubes, measured
 CAN_DIAMETER_M = 0.085        # 85 mm across, measured
 CAN_HEIGHT_M = 0.035          # 35 mm tall, measured
 TABLE_THICKNESS_M = 0.02
-# Provisional. See the note in the module docstring - Phase S2 settles this.
-TABLE_Z_M = -0.020
+
+_TABLE_Z = None
+
+
+def table_height(model_path=MODEL_PATH):
+    """Where the table is, in metres in the arm's frame. The one answer.
+
+    The arm is bolted to the table, so the table is the plane its base sits on,
+    and the model knows where that is: the lowest vertex of the base mesh. No
+    camera, no hand-eye, no homography - the same CAD the URDF and the forward
+    kinematics come from, and reproducible to the micron.
+
+    The three numbers this replaces, so nobody reaches for one of them again:
+
+      -8.5 mm   `data/table_frame.json` z_table. Not a table: it is the height
+                of the *gripper frame* when a block held in the jaws rests on
+                the table, and it was fitted through the old homography, so it
+                also carries the camera calibration's error.
+      -20 mm    the placeholder this constant used to hold, never measured.
+      -15.3 mm  Phase S5's derivation - the -8.5 above, plus the TCP's offset
+                below the gripper frame, minus half a block. Built on the first
+                one, so it inherits everything the first one carries, and it
+                moves whenever data/tcp.json does.
+
+    Using the real figure costs about 6 mm of apparent clearance against the old
+    one. That is the right direction to be wrong in.
+    """
+    global _TABLE_Z
+    if _TABLE_Z is None:
+        # A probe rig with its table far below, so nothing can rest on it and
+        # change the answer; then read where the base's own underside is. The
+        # pose is irrelevant - the base is a fixed body - but the kinematics
+        # have to be run at all, or every geom is still sitting at the origin.
+        probe = SO101Sim(model_path=model_path, table_z=-1.0)
+        probe.set_joints({name: 0.0 for name in probe.ARM_JOINTS},
+                         gripper_deg=0.0)
+        _TABLE_Z = float(probe.lowest_point(bodies=("base",)))
+    return _TABLE_Z
 
 BLOCK_COLOURS = {
     "red": (0.78, 0.18, 0.16), "orange": (0.85, 0.45, 0.13),
@@ -169,9 +203,13 @@ class SO101Sim:
                              [0.0, 1.0, 0.0],
                              [-1.0, 0.0, 0.0]])
 
-    def __init__(self, model_path=MODEL_PATH, table_z=TABLE_Z_M,
+    def __init__(self, model_path=MODEL_PATH, table_z=None,
                  table_size=(0.60, 0.80), blocks=(), can=None,
                  wrist_camera=None):
+        # None, not a constant default: the height is `table_height()`'s to
+        # decide, and a default written here would be a second place to change.
+        if table_z is None:
+            table_z = table_height(model_path)
         import mujoco
 
         self.mujoco = mujoco

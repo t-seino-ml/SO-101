@@ -33,7 +33,7 @@ from so101.policy.pick_plan import (
     measured_limits,
 )
 from so101.policy.tcp import ToolKinematics
-from so101.sim import SO101Sim
+from so101.sim import SO101Sim, table_height
 
 MARK = {"safe": "#", "marginal": "+", "unreachable": "."}
 
@@ -101,9 +101,10 @@ def main():
     arm = ToolKinematics()
     limits, found = measured_limits(arm.joint_limits_deg())
     arm.set_limits(limits)
-    probe = SO101Sim(table_z=-1.0)
-    probe.set_joints(PREFERRED, gripper_deg=35.0)
-    table_z = probe.lowest_point(bodies=("base",))
+    # Where the table is, from so101.sim - not worked out again here. This
+    # block used to be the only place that knew, which is how three other
+    # numbers stayed in circulation beside it.
+    table_z = table_height()
 
     print(f"  {arm}")
     print(f"  joint limits: {'measured travel' if found else 'URDF'}, "

@@ -117,13 +117,28 @@ WAYPOINT_TIMEOUT_S = 4.0
 #: Speed the 30 Hz interpolation asks for between waypoints.
 WRIST_SPEED_DEG_S = 8.0
 TRANSIT_SPEED_DEG_S = 5.0
-#: The arm starts folded, resting against itself - the twin reports the
-#: shoulder and the lower arm already in contact at the pose it is found in.
-#: Coming out of that is the one moment in the run where a joint might be
-#: pushing something rather than swinging free, so the first slice of the
-#: transit is taken at a crawl and looked at before the rest of it runs.
-BREAKOUT_FRACTION = 0.08
-BREAKOUT_SPEED_DEG_S = 1.5
+#: Getting off the table, before anything else moves, and only with the two
+#: joints that lift the gripper.
+#:
+#: The arm is parked with the gripper 2.9 mm above the table - it is resting
+#: there - and the obvious move is wrong. shoulder_lift, the joint that raises
+#: the arm, pushes the gripper *down* from this pose: +10 degrees of it puts the
+#: gripper 13.9 mm below the table. Interpolating every joint together does
+#: clear, but only because elbow_flex and wrist_flex lift faster than
+#: shoulder_lift pushes down, and that cancellation is exactly what fails when a
+#: joint lags. Measured in the twin: hold elbow_flex still and let shoulder_lift
+#: track, and 2% of the way through the transit the gripper is already through
+#: the table. elbow_flex is the joint that lagged on the first attempt.
+#:
+#: So shoulder_lift is not commanded at all until the gripper is clear. These
+#: two are, both of them upwards, and after 2 waypoints the clearance is 18.6 mm.
+LIFTOFF_DEG = {"elbow_flex": -8.0, "wrist_flex": -16.0}
+LIFTOFF_SPEED_DEG_S = 1.5
+#: Once lifted off, the arm may not come back below this. It is not applied to
+#: the parked pose itself - the arm is already sitting there and no path can
+#: change where it starts - but from the first commanded move onwards the
+#: clearance may only improve.
+CLEARANCE_FLOOR_MM = 10.0
 #: Written into the servos' Goal_Velocity, and restored to 0 afterwards. With
 #: no relative clamp on the commands this is the hardware's own ceiling on how
 #: fast anything can happen, so it matters more than it used to. Left at the
@@ -167,7 +182,11 @@ SAMPLE_HZ = 20
 VELOCITY_WINDOW_S = 0.25
 TICKS_PER_DEG = 4095 / 360    # LeRobot's own scale: (ticks - mid) * 360 / 4095
 DEFAULT_OUT = Path("outputs/real/r1_wrist_flex")
-TABLE_Z_M = -0.0085           # data/table_frame.json, the most real number there is
+#: The bodies whose distance to the table is what "clearance" means here. The
+#: base is not among them: it *is* the table's definition, so its clearance is
+#: zero by construction and would mask every other one.
+MOVING_BODIES = ("shoulder", "upper_arm", "lower_arm", "wrist", "gripper",
+                 "moving_jaw_so101_v1")
 
 
 class Abort(RuntimeError):
@@ -353,70 +372,122 @@ def waypoints(start, goal, step_deg=STEP_DEG):
             for step in range(1, steps + 1)]
 
 
-def replay(stages, start, log, table_z=TABLE_Z_M, fine=6):
-    """Fly the exact waypoint list in MuJoCo. Returns True if it is clear.
+def replay(stages, start, jaws_deg, log, fine=6):
+    """Fly the exact waypoint list in MuJoCo. Returns (clear, report).
 
     `fine` subdivides each waypoint interval further, because a collision can
     happen between two waypoints as easily as at one.
 
-    Two things are checked and they fail differently. A contact that is *new*
-    compared with where the arm already rests is one the path created; the
-    contacts the parked pose already has are the arm leaning on itself as it
-    sits there, and it leaves them on the first move.
-    """
-    from so101.sim.model import SO101Sim
+    Three things are checked and they fail differently.
 
-    bodies = ("shoulder", "upper_arm", "lower_arm", "wrist", "gripper",
-              "moving_jaw_so101_v1")
+    A contact that is *new* compared with where the arm already rests is one the
+    path created; the contacts the parked pose already has are the arm leaning
+    on itself as it sits there, and it leaves them on the first move.
+
+    Clearance to the table is judged against where the arm *starts*, not against
+    an absolute floor for every pose. It is parked 2.9 mm off the table, and no
+    path can change where it begins - what a path can do is make that worse, and
+    that is the thing worth refusing.
+
+    And after the lift-off stage, the floor does apply: nothing should come back
+    down.
+    """
+    from so101.sim import SO101Sim, table_height
+
+    table_z = table_height()
     ignore = tuple(f"block_{i}" for i in range(16)) + \
         tuple(f"block_{i}_geom" for i in range(16))
     sim = SO101Sim(table_z=table_z)
 
     def look(pose):
-        sim.set_joints(pose, gripper_deg=35.0)
+        # The jaws where they actually are, not where some other script opens
+        # them to: the gripper is the lowest thing here and its own angle moves
+        # it. This run never commands the gripper at all.
+        sim.set_joints(pose, gripper_deg=jaws_deg)
         found = {f"{a}/{b}" for a, b, _ in sim.collisions(ignore=ignore)
                  if "table" not in (a, b)}
-        return found, sim.lowest_point(bodies=bodies)
+        lowest = min(sim.lowest_point(bodies=(body,))
+                     for body in MOVING_BODIES)
+        return found, lowest - table_z
 
     here = dict(start)
-    baseline, _ = look(here)
+    baseline, parked = look(here)
+    log(f"    TABLE_Z        {1000*table_z:+.2f} mm（ベース底面。so101.sim."
+        f"table_height()）")
+    log(f"    MIN_CLEARANCE  {CLEARANCE_FLOOR_MM:.1f} mm（離陸後に守る下限）")
+    log(f"    駐機時のクリアランス {1000*parked:+.1f} mm"
+        f"（いま置かれている姿勢。経路では変えられません）")
     if baseline:
         log(f"    いまの休止姿勢はすでに自身に接触しています: {sorted(baseline)}")
         log("    （折り畳まれて寄りかかっている状態です。動き出せば離れます）")
+    log("")
+    log("    " + pad("stage", 30) + rpad("点", 5) + rpad("最小クリアランス", 18)
+        + "   判定")
 
     clear = True
+    report = {"table_z_mm": round(1000 * table_z, 3),
+              "clearance_floor_mm": CLEARANCE_FLOOR_MM,
+              "parked_clearance_mm": round(1000 * parked, 2), "stages": []}
+    lifted_off = False
     for label, path in stages:
-        lowest, offenders, worst_at = float("inf"), set(), None
+        least, offenders, worst_at = float("inf"), set(), None
+        # The lift-off's real guarantee is not a number, it is a direction: from
+        # a pose 2.9 mm off the table, the clearance may only increase. No path
+        # can better where the arm starts; what it must not do is go the other
+        # way, which is what shoulder_lift would do from here.
+        rising, previous_gap, dipped_at = not lifted_off, parked, None
         previous = dict(here)
         for target in path:
             for step in range(1, fine + 1):
-                pose = dict(previous)
-                pose.update({n: previous.get(n, here.get(n, 0.0))
-                             + (target[n] - previous.get(n, here.get(n, 0.0)))
+                pose = dict(here)
+                pose.update({n: previous[n] + (target[n] - previous[n])
                              * step / fine for n in target})
-                full = dict(here)
-                full.update(pose)
-                found, low = look(full)
-                if low < lowest:
-                    lowest, worst_at = low, dict(full)
+                found, gap = look(pose)
+                if gap < least:
+                    least, worst_at = gap, dict(pose)
+                if rising and gap < previous_gap - 1e-6 and dipped_at is None:
+                    dipped_at = (dict(pose), previous_gap, gap)
+                previous_gap = gap
                 offenders |= (found - baseline)
             previous = dict(previous)
             previous.update(target)
             here.update(target)
-        hit_table = lowest <= table_z
-        verdict = ("問題なし" if not offenders and not hit_table
-                   else "*** 干渉あり ***")
-        log(f"    {pad(label, 30)}{len(path):>4} 点   "
-            f"最低点 {1000*lowest:+7.1f} mm   {verdict}")
+
+        # Before the lift-off has finished, the arm is allowed to be as close as
+        # it was parked and no closer. After it, the floor applies.
+        allowed = CLEARANCE_FLOOR_MM / 1000 if lifted_off else parked
+        ok = not offenders and least >= allowed - 1e-9 and dipped_at is None
+        note = "" if not rising else ("、単調に増加" if dipped_at is None
+                                      else "、*** 途中で下がります ***")
+        log(f"    {pad(label, 30)}{len(path):>5}{1000*least:>15.1f} mm"
+            f"   {'問題なし' if ok else '*** 不可 ***'}{note}")
+        report["stages"].append({
+            "stage": label, "waypoints": len(path),
+            "min_clearance_mm": round(1000 * least, 2),
+            "required_mm": round(1000 * allowed, 2),
+            "monotonic": None if not rising else dipped_at is None,
+            "ok": bool(ok)})
         if offenders:
             log(f"      新たな自己干渉: {sorted(offenders)}")
             clear = False
-        if hit_table:
-            log(f"      机（{1000*table_z:+.1f} mm）に達します。そのときの姿勢:")
+        if least < allowed - 1e-9:
+            log(f"      クリアランスが {1000*allowed:.1f} mm を下回ります。"
+                f"そのときの姿勢:")
             log("        " + "、".join(f"{n} {worst_at[n]:+.1f}"
-                                        for n in ARM_JOINTS if n in worst_at))
+                                        for n in ARM_JOINTS))
             clear = False
-    return clear
+        if dipped_at is not None:
+            pose, before, after = dipped_at
+            log(f"      離陸中にクリアランスが下がります "
+                f"({1000*before:+.1f} → {1000*after:+.1f} mm)。そのときの姿勢:")
+            log("        " + "、".join(f"{n} {pose[n]:+.1f}" for n in ARM_JOINTS))
+            clear = False
+        lifted_off = True
+
+    report["min_clearance_mm"] = round(
+        1000 * min(s["min_clearance_mm"] for s in report["stages"]) / 1000, 2)
+    log(f"\n    経路全体の最小クリアランス {report['min_clearance_mm']:+.1f} mm")
+    return clear, report
 
 
 def stages_for(start, posture, target_deg, repeats, posture_only,
@@ -425,12 +496,16 @@ def stages_for(start, posture, target_deg, repeats, posture_only,
 
     One function, used by the twin and by the arm. When the two disagree about
     what is going to be flown, the twin's verdict is about something else.
+
+    The first stage only ever lifts. See LIFTOFF_DEG for why that is not the
+    same as the first slice of a straight line to the posture.
     """
     upright = dict(posture, wrist_flex=SAFE_DEG)
-    breakout = {n: start[n] + (upright[n] - start[n]) * BREAKOUT_FRACTION
-                for n in upright}
-    out = [("展開（折り畳みから）", waypoints(start, breakout)),
-           (f"{posture_name} へ", waypoints(breakout, upright))]
+    liftoff = {name: start[name] + move for name, move in LIFTOFF_DEG.items()}
+    lifted = dict(start)
+    lifted.update(liftoff)
+    out = [("離陸（机から離す）", waypoints(start, liftoff)),
+           (f"{posture_name} へ", waypoints(lifted, upright))]
     if posture_only:
         return out
     here = dict(upright)
@@ -784,7 +859,8 @@ def summarise(rows, label):
 # the report that comes before anything moves
 # -------------------------------------------------------------------------
 
-def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear):
+def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear,
+                clearance):
     wrist = arm[JOINT]
     target = args.to
     upright = dict(posture, wrist_flex=SAFE_DEG)
@@ -844,7 +920,7 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear):
         f"最大 {WAYPOINT_TIMEOUT_S:.0f} s 待つ")
     log(f"    {pad('phase 到達判定', 28)}全関節 ±{PHASE_TOLERANCE_DEG:.1f} deg 以内")
     log(f"    {pad('waypoint 間の補間', 28)}{FPS} Hz、"
-        f"展開 {BREAKOUT_SPEED_DEG_S:.1f} / 移動 {TRANSIT_SPEED_DEG_S:.0f} / "
+        f"離陸 {LIFTOFF_SPEED_DEG_S:.1f} / 移動 {TRANSIT_SPEED_DEG_S:.0f} / "
         f"手首 {WRIST_SPEED_DEG_S:.0f} deg/s")
     log(f"    {pad('Goal_Velocity', 28)}{GOAL_VELOCITY_DEG_S:.0f} deg/s "
         f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s)、"
@@ -856,6 +932,22 @@ def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear):
     if not args.posture_only:
         log(f"    {pad('保持', 28)}{args.hold:.1f} s、{SAMPLE_HZ} Hz で記録")
         log(f"    {pad('反復', 28)}{args.repeats} 回")
+
+    log("\n  --- 机までのクリアランス ---")
+    log(f"    {pad('TABLE_Z', 28)}{clearance['table_z_mm']:+.2f} mm"
+        f"（ベース底面。so101.sim.table_height() ただ一箇所から）")
+    log(f"    {pad('MIN_CLEARANCE', 28)}{clearance['clearance_floor_mm']:.1f} mm"
+        f"（離陸後に守る下限）")
+    log(f"    {pad('駐機時', 28)}{clearance['parked_clearance_mm']:+.1f} mm"
+        f"（いま置かれている姿勢。経路では変えられません）")
+    log(f"    {pad('経路全体の最小', 28)}{clearance['min_clearance_mm']:+.1f} mm")
+    for stage in clearance["stages"]:
+        log(f"      {pad(stage['stage'], 28)}"
+            f"{stage['min_clearance_mm']:>7.1f} mm  "
+            f"（要求 {stage['required_mm']:.1f} mm）"
+            f"  {'OK' if stage['ok'] else '*** 不可 ***'}")
+    log("    古い data/table_frame.json の -8.5 mm は使っていません。あれは")
+    log("    机面ではなく、ブロックを咥えたときの gripper frame の高さです。")
 
     log("\n  --- 走行を止める条件 ---")
     log("    [移動中]")
@@ -973,10 +1065,10 @@ def main():
                             args.posture_only, args.posture)
 
         log("\n  --- 送信する waypoint 列を、そのまま MuJoCo で再生します ---")
-        clear = replay(stages, start, log)
+        clear, clearance = replay(stages, start, arm["gripper"]["deg"], log)
 
         ok = plan_report(args, arm, posture, stages, out_dir, lock_path, log,
-                         clear)
+                         clear, clearance)
         if args.dry_run:
             log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
@@ -984,10 +1076,10 @@ def main():
             raise SystemExit(
                 "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
 
-        run(args, arm, posture, stages, port, out_dir, log)
+        run(args, arm, posture, stages, port, out_dir, log, clearance)
 
 
-def run(args, arm, posture, stages, port, out_dir, log):
+def run(args, arm, posture, stages, port, out_dir, log, clearance):
     """Everything from here on moves the arm."""
     import numpy as np  # noqa: F401 - summarise needs it; fail early if absent
 
@@ -1073,12 +1165,15 @@ def run(args, arm, posture, stages, port, out_dir, log):
             "phase_tolerance_deg": PHASE_TOLERANCE_DEG,
             "wrist_speed_deg_s": WRIST_SPEED_DEG_S,
             "transit_speed_deg_s": TRANSIT_SPEED_DEG_S,
-            "breakout_speed_deg_s": BREAKOUT_SPEED_DEG_S,
+            "liftoff_speed_deg_s": LIFTOFF_SPEED_DEG_S,
+            "liftoff_deg": LIFTOFF_DEG,
+            "clearance_floor_mm": CLEARANCE_FLOOR_MM,
             "goal_velocity_ticks_s": goal_velocity,
             "max_relative_target_deg": MAX_RELATIVE_TARGET,
             "fps": FPS, "p_coefficient": tuning.p_coefficient(),
         },
-        "git": git_state(), "arrivals": [], "holds": [],
+        "git": git_state(), "clearance": clearance,
+        "arrivals": [], "holds": [],
     }
 
     try:
@@ -1098,18 +1193,22 @@ def run(args, arm, posture, stages, port, out_dir, log):
         here = joints_of(robot)
         log("  読み戻し: " + "、".join(f"{n} {here[n]:+.1f}" for n in ARM_JOINTS))
 
-        breakout, to_posture = stages[0], stages[1]
+        liftoff, to_posture = stages[0], stages[1]
 
-        log(f"\n  --- {pad('1. ' + breakout[0], 26)}{len(breakout[1])} 点、"
-            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s ---")
-        log("  自身に寄りかかった姿勢から抜け出す区間です。")
+        log(f"\n  --- {pad('1. ' + liftoff[0], 26)}{len(liftoff[1])} 点、"
+            f"{LIFTOFF_SPEED_DEG_S:.1f} deg/s ---")
+        log("  グリッパは机から 2.9 mm のところに置かれています。ここで動かす")
+        log("  のは、それを持ち上げる elbow_flex と wrist_flex だけです。")
+        log("  shoulder_lift はこの姿勢からではグリッパを下げるので、クリア")
+        log("  ランスが確保できるまで一切指令しません。")
         if input("  動かすなら ENTER（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
-        walk(robot, watch, breakout[1], "unfold", "shoulder_lift",
-             breakout[1][-1]["shoulder_lift"], 0, BREAKOUT_SPEED_DEG_S, log,
-             label=breakout[0])
+        walk(robot, watch, liftoff[1], "liftoff", "elbow_flex",
+             liftoff[1][-1]["elbow_flex"], 0, LIFTOFF_SPEED_DEG_S, log,
+             label=liftoff[0])
         log(f"    wrist_flex  負荷 {watch.rows[-1]['load']}、"
             f"{watch.rows[-1]['temperature_c']} C")
+        log("    グリッパは机から離れました。ここから shoulder_lift を使います。")
         if input("  異常がなければ ENTER で継続（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
 

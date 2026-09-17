@@ -12,9 +12,20 @@ replace it, and afterwards for the things ikpy has no opinion about: collision,
 contact, and rendering a camera view.
 
 - `model`   load the arm, build a table/block/can scene, read frames back
+
+`table_height()` is the single answer to where the table is. Four different
+values were in circulation before it existed, and a clearance figure means
+nothing until it says which one it was measured against.
 """
 
-from .model import SO101Sim, TABLE_THICKNESS_M, BLOCK_SIZE_M, CAN_DIAMETER_M, CAN_HEIGHT_M
+from .model import (
+    SO101Sim,
+    BLOCK_SIZE_M,
+    CAN_DIAMETER_M,
+    CAN_HEIGHT_M,
+    TABLE_THICKNESS_M,
+    table_height,
+)
 
-__all__ = ["SO101Sim", "TABLE_THICKNESS_M", "BLOCK_SIZE_M",
+__all__ = ["SO101Sim", "table_height", "TABLE_THICKNESS_M", "BLOCK_SIZE_M",
            "CAN_DIAMETER_M", "CAN_HEIGHT_M"]
