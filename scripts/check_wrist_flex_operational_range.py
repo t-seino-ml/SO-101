@@ -1019,7 +1019,7 @@ def replay(stages, start, table, log, fine=6):
 
 
 def stages_for(start, posture, target_deg, repeats, posture_only,
-               posture_name="upright", liftoff=None):
+               posture_name="upright", liftoff=None, fraction=1.0):
     """Every move the run will make, named, as waypoint lists.
 
     One function, used by the twin and by the arm. When the two disagree about
@@ -1035,7 +1035,17 @@ def stages_for(start, posture, target_deg, repeats, posture_only,
     if liftoff:
         out.append(("離陸（机から離す）", waypoints(start, liftoff), "transit"))
         lifted.update(liftoff)
-    out.append((f"{posture_name} へ", waypoints(lifted, upright), "transit"))
+    if fraction < 1.0:
+        # Part of the way and stop. The waypoints are a straight line in joint
+        # space, so a fraction of it is the same line - the arm ends up
+        # somewhere on the path it would have taken anyway, which is what makes
+        # this a rehearsal of the real move rather than a different one.
+        upright = {n: lifted[n] + (upright[n] - lifted[n]) * fraction
+                   for n in upright}
+        label = f"{posture_name} へ {100*fraction:.0f}% だけ"
+    else:
+        label = f"{posture_name} へ"
+    out.append((label, waypoints(lifted, upright), "transit"))
     if posture_only:
         return out
     here = dict(upright)
@@ -1563,6 +1573,10 @@ def main():
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
     parser.add_argument("--posture-only", action="store_true",
                         help="姿勢へ行って到達を確認し、戻るだけ。手首は振りません")
+    parser.add_argument("--fraction", type=float, default=1.0, metavar="F",
+                        help="姿勢までの道のりのうち F だけ進んで止まります"
+                             "（0<F<=1）。動作系を短い移動で確かめてから"
+                             "全行程に進むためのものです。--posture-only 専用")
     parser.add_argument("--support", metavar="x0,x1,y0,y1,top",
                         help="机に置いたままにする支持物の箱を mm で。"
                              "ベース中心が原点、x は前方、y は左方、"
@@ -1595,6 +1609,12 @@ def main():
         from so101.hardware import resolve as resolve_port
         where(resolve_port([args.follower_port])[0], Log(), support)
         return
+    if not 0.0 < args.fraction <= 1.0:
+        raise SystemExit("\n  --fraction は 0 より大きく 1 以下にしてください\n")
+    if args.fraction < 1.0 and not args.posture_only:
+        raise SystemExit(
+            "\n  --fraction は --posture-only と一緒にだけ使えます。"
+            "手首の掃引を途中で止めても測るものがありません。\n")
     if args.posture_only:
         args.to = 0.0
     elif args.to is None:
@@ -1643,7 +1663,8 @@ def main():
         report_liftoff(detail, liftoff, log)
 
         stages = stages_for(start, posture, args.to, args.repeats,
-                            args.posture_only, args.posture, liftoff)
+                            args.posture_only, args.posture, liftoff,
+                            args.fraction)
 
         log("\n  --- 送信する waypoint 列を、そのまま MuJoCo で再生します ---")
         clear, clearance = replay(stages, start, table, log)
@@ -1665,8 +1686,14 @@ def main():
         clearance["measured_clearance_mm"] = measured
         clearance["measured_floor_mm"] = MEASURED_FLOOR_MM
         if measured is None:
-            start_ok = clearance["start_clearance_mm"] >= CLEARANCE_FLOOR_MM
-            clearance["start_basis"] = "model"
+            # The gripper's own clearance, not the lowest thing on the arm.
+            # That is the shoulder, sitting 18.6 mm up wherever the arm is
+            # pointed - a constant of the robot's own structure that never
+            # moves towards the table, so gating on it gates on nothing. The
+            # gripper is the part that can arrive somewhere it should not.
+            start_ok = (clearance["start_gripper_clearance_mm"]
+                        >= CLEARANCE_FLOOR_MM)
+            clearance["start_basis"] = "model (gripper)"
         else:
             start_ok = measured >= MEASURED_FLOOR_MM
             clearance["start_basis"] = "measured"
@@ -1858,8 +1885,13 @@ def run(args, arm, posture, stages, port, out_dir, log, clearance,
                        label=to_posture[0])
         result["posture_reached_deg"] = {n: round(reached[n], 2)
                                          for n in ARM_JOINTS}
-        result["upright_reached"] = True
-        log("\n  UPRIGHT_REACHED — 全関節が許容範囲内です")
+        result["fraction"] = args.fraction
+        result["upright_reached"] = args.fraction >= 1.0
+        if args.fraction >= 1.0:
+            log("\n  UPRIGHT_REACHED — 全関節が許容範囲内です")
+        else:
+            log(f"\n  道のりの {100*args.fraction:.0f}% まで到達しました。"
+                f"姿勢そのものへはまだ行っていません。")
         result["arrivals"].append({"phase": "upright", "ok": True,
                                    "pose": result["posture_reached_deg"]})
 
@@ -2100,6 +2132,9 @@ def verdict(result, args, log):
         result["verdict"] = "aborted"
         return
     if args.posture_only:
+        if result.get("fraction", 1.0) < 1.0:
+            log(f"  道のりの {100*result['fraction']:.0f}% までの試走です。"
+                f"UPRIGHT_REACHED はまだ主張しません。")
         log("  UPRIGHT_REACHED: " + ("はい" if result.get("upright_reached")
                                      else "いいえ"))
         for name, value in result.get("posture_reached_deg", {}).items():
