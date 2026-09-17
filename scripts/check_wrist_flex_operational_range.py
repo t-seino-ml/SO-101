@@ -537,10 +537,16 @@ def where(port, log):
         j = arm[name]
         room = min(j["deg"] - j["min_deg"], j["max_deg"] - j["deg"])
         log(f"  {pad(name, 16)}{j['deg']:>+9.2f}{j['ticks']:>8}{room:>9.1f} deg")
+    lows = {body: table.sim.lowest_point(bodies=(body,))
+            for body in MOVING_BODIES}
+    body = min(lows, key=lows.get)
     verdict = ("十分です" if 1000 * gap >= CLEARANCE_WANTED_MM else
                "下限は満たします" if 1000 * gap >= CLEARANCE_FLOOR_MM else
                "*** 足りません ***")
     log(f"\n  机までのクリアランス {1000*gap:+.1f} mm   {verdict}")
+    log(f"    最下点は {body}、机面から {1000*gap:+.1f} mm の高さ")
+    log("    これはモデルの予測です。定規で実測した値と一致するとは限りません")
+    log("    — 一致しない分が、そのまま Sim→Real の差です。")
     log(f"    下限 {CLEARANCE_FLOOR_MM:.0f} mm / 望ましくは "
         f"{CLEARANCE_WANTED_MM:.0f} mm 以上")
     if contacts:
