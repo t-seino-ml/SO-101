@@ -15,22 +15,39 @@ is decided afterwards from the whole set of angles, both directions.
 Why wrist_flex first. Over the 902 waypoints of the simulated 15x15 pick
 workspace, wrist_flex is the joint nearest its operational limit at 704 of them
 - 78%, against 19% for wrist_roll and 1% for everything else. It is the joint
-that decides how much of the table can be picked from, so how far it really
-goes is worth more than any other measurement on this arm.
+that decides how much of the table can be picked from.
 
     ONE ANGLE PER RUN. There is deliberately no way to sweep. Each run is
     looked at by a person before the next angle is chosen.
 
-        uv run scripts/check_wrist_flex_operational_range.py --to +70 --dry-run
-        uv run scripts/check_wrist_flex_operational_range.py --to +70
+        uv run scripts/check_wrist_flex_operational_range.py --posture-only
+        uv run scripts/check_wrist_flex_operational_range.py --to +20
+        uv run scripts/check_wrist_flex_operational_range.py --to +20 --dry-run
 
-The posture matters as much as the angle. Swung from the folded rest pose the
-wrist collides with the shoulder over the whole travel - checked against the
-MuJoCo twin, lowest point 24 mm *below* the table - so the arm is first taken
-to a posture where the sweep is clear. Straight up: pan 0, lift 0, elbow 0,
-roll 0. There the twin puts the lowest arm point at +16 mm for every wrist_flex
-from -100 to +100, and gravity asks wrist_flex for 0.117 N.m at worst, about 4%
-of what the servo can hold. A load much above that is not the arm working.
+WHAT THE FIRST ATTEMPT GOT WRONG, because all of it is now load-bearing:
+
+  The run was given max_relative_target = 2 degrees, meaning every command was
+  clamped to within 2 degrees of where the joint already was. That caps the
+  position error the servo ever sees, which caps the torque it develops. A
+  joint carrying any weight then cannot advance, the interpolation walks away
+  from it, and the command sits pinned at exactly present + 2 for ever. Measured:
+  the tracking error held at -2.00 degrees, to the hundredth, for 4.6 seconds.
+
+  elbow_flex lost that argument during the transit and stopped at +52.8 degrees
+  when it had been asked for 0. Nothing checked, so the run called the posture
+  reached and swung the wrist. With the elbow at +50 the arm is not standing up,
+  it is reaching out over the table: replayed in the twin, that sweep puts the
+  lowest point of the gripper 34.8 mm below a table at -8.5 mm. The wrist stopped
+  at +34.6 degrees against a load of 132 where gravity asks for 0.6% of stall.
+  It was pressing on the table.
+
+  So: no relative clamp; speed comes from the interpolation and Goal_Velocity.
+  Every waypoint is confirmed reached before the next is sent. Every phase ends
+  with an arrival check across *all* the joints it moved, and a phase that did
+  not arrive does not hand over to the next one. Stall detection runs while
+  moving, not only while holding - a joint 35 degrees short and motionless is
+  the thing to catch, and catching it as a "tracking error" at a phase boundary
+  2.5 seconds later was luck, not design.
 """
 
 from so101.platform import require_windows
@@ -83,9 +100,21 @@ POSTURES = {
                 "wrist_roll": 0.0},
 }
 
-# -- how fast anything is allowed to happen -------------------------------
-#: Joint speed the interpolation asks for. Slow enough to watch, and slow
-#: enough that stopping between two commands costs a fraction of a degree.
+# -- how the arm is moved -------------------------------------------------
+#: How far apart the confirmed waypoints are, on the fastest-moving joint. The
+#: arm is walked from one to the next and each is confirmed reached before the
+#: next is sent, so this is also how far wrong a single unnoticed step can go.
+STEP_DEG = 3.0
+#: Within this of a waypoint counts as reached. The servos settle a few tenths
+#: short under gravity with no integral term, so demanding much less than this
+#: would be demanding something the hardware does not do.
+ARRIVE_DEG = 0.8
+#: A phase has arrived only when every joint it moved is this close. Looser than
+#: a waypoint because it is checked once the arm has stopped and settled.
+PHASE_TOLERANCE_DEG = 1.5
+#: Longest a single waypoint may take before it counts as not arriving.
+WAYPOINT_TIMEOUT_S = 4.0
+#: Speed the 30 Hz interpolation asks for between waypoints.
 WRIST_SPEED_DEG_S = 8.0
 TRANSIT_SPEED_DEG_S = 5.0
 #: The arm starts folded, resting against itself - the twin reports the
@@ -95,41 +124,59 @@ TRANSIT_SPEED_DEG_S = 5.0
 #: transit is taken at a crawl and looked at before the rest of it runs.
 BREAKOUT_FRACTION = 0.08
 BREAKOUT_SPEED_DEG_S = 1.5
-#: Written into the servos' Goal_Velocity, and restored to 0 afterwards. It is
-#: a ceiling under the interpolation rather than the thing that sets the speed:
-#: a servo held at its velocity limit lags its command, and a lag is what the
-#: tracking check is meant to be reading as a fault. Left at the factory's 0 -
-#: which means "no limit" - one dropped step commands the joint at full speed.
+#: Written into the servos' Goal_Velocity, and restored to 0 afterwards. With
+#: no relative clamp on the commands this is the hardware's own ceiling on how
+#: fast anything can happen, so it matters more than it used to. Left at the
+#: factory's 0 - which means "no limit" - one stray write is a full-speed move.
 GOAL_VELOCITY_DEG_S = 15.0
 FPS = 30
-#: LeRobot clamps each command this far from where the joint actually is. The
-#: interpolation steps are ~0.3 degrees, so this never bites in normal running;
-#: it is there for the step that should never have been sent.
-MAX_RELATIVE_TARGET_DEG = 2.0
+#: Deliberately not used. See the module docstring: clamping each command to
+#: within a couple of degrees of the present position caps the servo's position
+#: error, caps its torque, and stalls any joint carrying weight. Speed is the
+#: interpolation's job and Goal_Velocity's; it is not this one's.
+MAX_RELATIVE_TARGET = None
 
 # -- when to stop ---------------------------------------------------------
 # None of these is a safe level. They are the point past which the run stops
-# and a person looks at it. The expected load for this sweep is around 40 of
+# and a person looks at it. The expected load for the sweep is around 40 of
 # 1023, from the 0.117 N.m gravity asks at worst.
 LOAD_ABORT = 400              # of 1023 full scale
-TRACKING_ABORT_DEG = 5.0
-TRACKING_RATE_ABORT_DEG_S = 2.0
 TEMPERATURE_ABORT_C = 55
 COMMS_ABORT = 3               # consecutive failed reads
-#: During a hold: this much error, with the joint no longer moving, is a joint
-#: that has stopped answering its command rather than one still on its way.
-STALL_ERROR_DEG = 2.0
-STALL_MOVEMENT_DEG = 0.1
-STALL_WINDOW_S = 1.0
+#: MOVING. A joint still short of its waypoint that has stopped moving is the
+#: fault worth catching, and it is not the same thing as a large tracking
+#: error: a joint on its way to a target it will reach is behind by design.
+#: A joint within this of its waypoint is not judged on speed: it is close
+#: enough that the waypoint's own arrival timeout is the right thing to catch,
+#: and a joint settling the last half-degree is meant to be slowing down.
+STALL_REMAINING_DEG = 2.0
+STALL_SPEED_DEG_S = 0.25
+#: Speed is measured over this window and the verdict then has to hold for this
+#: long again, so a stall is called after about a second. Measuring over one
+#: window and then waiting out a second full one took two and a bit.
+STALL_WINDOW_S = 0.5
+STALL_PERSIST_S = 0.5
+#: MOVING. Going the wrong way is never a lag.
+RETREAT_DEG = 1.5
+RETREAT_WINDOW_S = 0.5
+#: HOLDING. Only once a waypoint has been confirmed reached does being away
+#: from it mean anything, and then it means a great deal.
+HOLD_ERROR_ABORT_DEG = 5.0
 
 SAMPLE_HZ = 20
+VELOCITY_WINDOW_S = 0.25
 TICKS_PER_DEG = 4095 / 360    # LeRobot's own scale: (ticks - mid) * 360 / 4095
 DEFAULT_OUT = Path("outputs/real/r1_wrist_flex")
+TABLE_Z_M = -0.0085           # data/table_frame.json, the most real number there is
 
 
 class Abort(RuntimeError):
     """Something crossed a threshold. The run stops; the arm keeps holding."""
 
+
+# -------------------------------------------------------------------------
+# printing next to a machine
+# -------------------------------------------------------------------------
 
 def cells(text):
     """How many terminal columns `text` occupies.
@@ -153,6 +200,24 @@ def pad(text, columns):
 def rpad(text, columns):
     """Right-align `text` in `columns` terminal columns."""
     return " " * max(0, columns - cells(text)) + text
+
+
+class Log:
+    """Print to the screen and to the run's own file, so nothing is only scrollback."""
+
+    def __init__(self, path=None):
+        self.file = None if path is None else open(path, "w", encoding="utf-8")
+
+    def __call__(self, line=""):
+        print(line)
+        if self.file is not None:
+            self.file.write(line + "\n")
+            self.file.flush()
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
 
 # -------------------------------------------------------------------------
@@ -190,9 +255,9 @@ def only_one(path):
             # `from None`: the refusal is the message, not a stack trace. The
             # OSError underneath it says nothing a person needs.
             raise SystemExit(
-                f"\n  Refusing to start: {holder or 'another process'} is "
-                f"already running this script.\n  Lock: {path}\n"
-                "  Wait for it to finish, or stop it, before running again.\n"
+                f"\n  すでに {holder or '別のプロセス'} がこのスクリプトを"
+                f"実行中です。\n  ロック: {path}\n"
+                "  終了を待つか、そちらを止めてから実行してください。\n"
             ) from None
         note.write_text(
             f"pid {os.getpid()} since "
@@ -209,24 +274,6 @@ def only_one(path):
         note.unlink(missing_ok=True)
 
 
-
-class Log:
-    """Print to the screen and to the run's own file, so nothing is only scrollback."""
-
-    def __init__(self, path=None):
-        self.file = None if path is None else open(path, "w", encoding="utf-8")
-
-    def __call__(self, line=""):
-        print(line)
-        if self.file is not None:
-            self.file.write(line + "\n")
-            self.file.flush()
-
-    def close(self):
-        if self.file is not None:
-            self.file.close()
-
-
 # -------------------------------------------------------------------------
 # reading the arm without waking it
 # -------------------------------------------------------------------------
@@ -235,7 +282,7 @@ def read_arm(port):
     """Every joint's angle, limit and temperature, over the raw bus.
 
     Read-only, and before LeRobot is involved: connecting enables torque, and
-    the transit has to be planned and checked against the twin while the arm is
+    the plan has to be built and checked against the twin while the arm is
     still limp.
 
     Degrees are LeRobot's: zero is the midpoint of the calibrated range, which
@@ -251,13 +298,13 @@ def read_arm(port):
         for sid, name in JOINT_NAMES.items():
             if not bus.ping(sid):
                 raise SystemExit(
-                    f"  {name} (ID {sid}) does not answer on {port}. "
-                    "Check power and the bus before going further.")
+                    f"  {name} (ID {sid}) が {port} で応答しません。"
+                    "電源とバスを確認してください。")
             low = bus.read(sid, MIN_ANGLE_LIMIT, 2)
             high = bus.read(sid, MAX_ANGLE_LIMIT, 2)
             ticks = bus.read(sid, PRESENT_POSITION, 2)
             if None in (low, high, ticks):
-                raise SystemExit(f"  could not read {name} on {port}")
+                raise SystemExit(f"  {port} の {name} を読めませんでした")
             mid = (low + high) / 2
             out[name] = {
                 "id": sid, "ticks": ticks, "min_ticks": low, "max_ticks": high,
@@ -280,76 +327,121 @@ def joints_of(robot):
 
 
 def ticks_for(deg, arm, joint=JOINT):
+    """The raw servo position LeRobot will write for this joint angle."""
     return arm[joint]["mid_ticks"] + deg * TICKS_PER_DEG
 
 
-def transit_times(biggest_deg):
-    """(unfolding, the rest) in seconds, for a transit whose largest joint
-    moves `biggest_deg`."""
-    return (max(3.0, biggest_deg * BREAKOUT_FRACTION / BREAKOUT_SPEED_DEG_S),
-            max(6.0, biggest_deg * (1 - BREAKOUT_FRACTION) / TRANSIT_SPEED_DEG_S))
-
-
 # -------------------------------------------------------------------------
-# the twin says whether the plan is clear before the arm is asked to fly it
+# the path, as a list - the same list the twin replays and the arm is sent
 # -------------------------------------------------------------------------
 
-def sim_check(start_deg, posture, target_deg, log):
-    """Fly the whole plan in MuJoCo first. Returns True if it is clear.
+def waypoints(start, goal, step_deg=STEP_DEG):
+    """Poses from `start` to `goal`, no joint moving more than `step_deg` at a time.
 
-    Two things are checked and they fail differently: a contact that is *new*
-    compared with where the arm already rests is a collision the plan created,
-    while the contacts the parked pose already has are the arm leaning on
-    itself as it sits there, and it leaves them as soon as it moves.
+    Computed once, from where the arm is, and then not recomputed. That is what
+    makes the twin's replay worth anything: if the waypoints were re-derived
+    from wherever the arm had got to, the path actually flown would not be the
+    path that was cleared.
+
+    Every pose carries every joint in `goal`, so a joint that is not supposed to
+    move is commanded to stay rather than left to the servo's memory.
+    """
+    moved = {name: goal[name] - start[name] for name in goal}
+    biggest = max((abs(v) for v in moved.values()), default=0.0)
+    steps = max(1, int(round(biggest / step_deg)))
+    return [{name: start[name] + moved[name] * step / steps for name in goal}
+            for step in range(1, steps + 1)]
+
+
+def replay(stages, start, log, table_z=TABLE_Z_M, fine=6):
+    """Fly the exact waypoint list in MuJoCo. Returns True if it is clear.
+
+    `fine` subdivides each waypoint interval further, because a collision can
+    happen between two waypoints as easily as at one.
+
+    Two things are checked and they fail differently. A contact that is *new*
+    compared with where the arm already rests is one the path created; the
+    contacts the parked pose already has are the arm leaning on itself as it
+    sits there, and it leaves them on the first move.
     """
     from so101.sim.model import SO101Sim
 
-    table_z = -0.0085      # data/table_frame.json, the most real number there is
     bodies = ("shoulder", "upper_arm", "lower_arm", "wrist", "gripper",
               "moving_jaw_so101_v1")
     ignore = tuple(f"block_{i}" for i in range(16)) + \
         tuple(f"block_{i}_geom" for i in range(16))
-
     sim = SO101Sim(table_z=table_z)
 
-    def contacts(pose):
+    def look(pose):
         sim.set_joints(pose, gripper_deg=35.0)
         found = {f"{a}/{b}" for a, b, _ in sim.collisions(ignore=ignore)
                  if "table" not in (a, b)}
         return found, sim.lowest_point(bodies=bodies)
 
-    start = {name: start_deg[name] for name in ARM_JOINTS}
-    baseline, _ = contacts(start)
+    here = dict(start)
+    baseline, _ = look(here)
     if baseline:
         log(f"    いまの休止姿勢はすでに自身に接触しています: {sorted(baseline)}")
         log("    （折り畳まれて寄りかかっている状態です。動き出せば離れます）")
 
-    stages = []
-    goal = dict(posture, wrist_flex=SAFE_DEG)
-    stages.append(("姿勢への移動", [
-        {n: start[n] + (goal[n] - start[n]) * s / 60 for n in ARM_JOINTS}
-        for s in range(61)]))
-    stages.append((f"wrist_flex {SAFE_DEG:+.0f} → {target_deg:+.0f}", [
-        dict(goal, wrist_flex=SAFE_DEG + (target_deg - SAFE_DEG) * s / 60)
-        for s in range(61)]))
-
     clear = True
     for label, path in stages:
-        lowest, offenders = float("inf"), set()
-        for pose in path:
-            found, low = contacts(pose)
-            lowest = min(lowest, low)
-            offenders |= (found - baseline)
-        verdict = ("問題なし" if not offenders and lowest > table_z
+        lowest, offenders, worst_at = float("inf"), set(), None
+        previous = dict(here)
+        for target in path:
+            for step in range(1, fine + 1):
+                pose = dict(previous)
+                pose.update({n: previous.get(n, here.get(n, 0.0))
+                             + (target[n] - previous.get(n, here.get(n, 0.0)))
+                             * step / fine for n in target})
+                full = dict(here)
+                full.update(pose)
+                found, low = look(full)
+                if low < lowest:
+                    lowest, worst_at = low, dict(full)
+                offenders |= (found - baseline)
+            previous = dict(previous)
+            previous.update(target)
+            here.update(target)
+        hit_table = lowest <= table_z
+        verdict = ("問題なし" if not offenders and not hit_table
                    else "*** 干渉あり ***")
-        log(f"    {pad(label, 28)}最低点 {1000*lowest:+7.1f} mm   {verdict}")
+        log(f"    {pad(label, 30)}{len(path):>4} 点   "
+            f"最低点 {1000*lowest:+7.1f} mm   {verdict}")
         if offenders:
             log(f"      新たな自己干渉: {sorted(offenders)}")
             clear = False
-        if lowest <= table_z:
-            log(f"      机（{1000*table_z:+.1f} mm）に達します")
+        if hit_table:
+            log(f"      机（{1000*table_z:+.1f} mm）に達します。そのときの姿勢:")
+            log("        " + "、".join(f"{n} {worst_at[n]:+.1f}"
+                                        for n in ARM_JOINTS if n in worst_at))
             clear = False
     return clear
+
+
+def stages_for(start, posture, target_deg, repeats, posture_only,
+               posture_name="upright"):
+    """Every move the run will make, named, as waypoint lists.
+
+    One function, used by the twin and by the arm. When the two disagree about
+    what is going to be flown, the twin's verdict is about something else.
+    """
+    upright = dict(posture, wrist_flex=SAFE_DEG)
+    breakout = {n: start[n] + (upright[n] - start[n]) * BREAKOUT_FRACTION
+                for n in upright}
+    out = [("展開（折り畳みから）", waypoints(start, breakout)),
+           (f"{posture_name} へ", waypoints(breakout, upright))]
+    if posture_only:
+        return out
+    here = dict(upright)
+    for repeat in range(1, repeats + 1):
+        out.append((f"{repeat} 回目: wrist_flex → {target_deg:+.0f}",
+                    waypoints(here, {JOINT: target_deg})))
+        here[JOINT] = target_deg
+        out.append((f"{repeat} 回目: wrist_flex → {SAFE_DEG:+.0f}",
+                    waypoints(here, {JOINT: SAFE_DEG})))
+        here[JOINT] = SAFE_DEG
+    return out
 
 
 # -------------------------------------------------------------------------
@@ -357,56 +449,98 @@ def sim_check(start_deg, posture, target_deg, log):
 # -------------------------------------------------------------------------
 
 class Watch:
-    """Samples the joint and stops the run when something stops being ordinary.
+    """Samples the arm and stops the run when something stops being ordinary.
 
-    Every sample is written out as it is taken rather than collected and saved
-    at the end: the samples worth having most are the ones from the run that
-    did not finish.
+    The three numbers a reader has to be able to tell apart are kept in three
+    columns and never mixed, because mixing them is how the first attempt
+    reported a 35 degree fault that was really a change of reference:
+
+      nominal_target_deg  where the phase is ultimately going
+      waypoint_target_deg the confirmed step being walked to right now
+      sent_goal_deg       what went into send_action for this sample
+
+    Every sample is written as it is taken rather than collected and saved at
+    the end: the samples worth having most are the ones from the run that did
+    not finish.
     """
 
-    FIELDS = ("timestamp", "elapsed_s", "joint", "direction", "phase", "repeat",
-              "target_deg", "commanded_deg", "measured_deg",
-              "tracking_error_deg", "load", "current", "temperature_c",
-              "voltage_v", "torque_enable", "hold_time_s", "status", "notes")
+    FIELDS = ("timestamp", "elapsed_s", "phase", "repeat", "waypoint",
+              "subject", "nominal_target_deg", "waypoint_target_deg",
+              "sent_goal_deg", "measured_deg", "tracking_error_deg",
+              "remaining_to_waypoint_deg", "remaining_to_nominal_deg",
+              "velocity_deg_s", "load", "current", "temperature_c",
+              "voltage_v", "torque_enable", "hold_time_s", "arrival", "stall",
+              "max_joint_error_deg", "worst_joint",
+              *(f"{name}_deg" for name in ARM_JOINTS),
+              "status", "notes")
 
-    def __init__(self, robot, writer, log, target_deg):
+    def __init__(self, robot, writer, log):
         self.robot = robot
         self.writer = writer
         self.log = log
-        self.target_deg = target_deg
-        self.direction = "positive" if target_deg >= 0 else "negative"
         self.started = time.perf_counter()
-        self.history = []          # (t, measured, error)
         self.comms_failures = 0
         self.current_ever_nonzero = False
         self.rows = []
+        self.history = []       # (t, {joint: measured})
+        self.reset("idle", subject=JOINT, nominal=0.0)
 
-    def read_one(self, name, default=None):
+    # -- what the current phase is about ----------------------------------
+
+    def reset(self, phase, subject, nominal, repeat=0):
+        self.phase = phase
+        self.subject = subject
+        self.nominal = nominal
+        self.repeat = repeat
+        self.waypoint_index = 0
+        self.waypoint = {}
+        self.sent = {}
+        self.stalled_since = None
+        self.retreat_since = None
+
+    # -- reading ----------------------------------------------------------
+
+    def read_one(self, name, joint=None, default=None):
         try:
-            value = self.robot.bus.read(name, JOINT, normalize=False)
+            value = self.robot.bus.read(name, joint or self.subject,
+                                        normalize=False)
             self.comms_failures = 0
             return value
         except Exception:  # noqa: BLE001 - a dropped packet is not a fault yet
             self.comms_failures += 1
             if self.comms_failures >= COMMS_ABORT:
-                raise Abort(f"{self.comms_failures} reads in a row failed "
+                raise Abort(f"{self.comms_failures} 回連続で読み出しに失敗 "
                             f"({name})")
             return default
 
-    def sample(self, phase, repeat, commanded_deg, hold_time=None,
-               status="ok", notes=""):
+    def velocity(self, pose, now):
+        """Degrees per second of the subject joint, over a short window."""
+        older = [h for h in self.history if now - h[0] >= VELOCITY_WINDOW_S]
+        if not older:
+            return 0.0
+        when, then = older[-1]
+        span = now - when
+        if span <= 0 or self.subject not in then:
+            return 0.0
+        return (pose[self.subject] - then[self.subject]) / span
+
+    def sample(self, hold_time=None, status="ok", notes="", arrival="",
+               judge=True):
         now = time.perf_counter()
         try:
-            measured = joints_of(self.robot)[JOINT]
+            pose = joints_of(self.robot)
             self.comms_failures = 0
         except Exception as error:  # noqa: BLE001
             self.comms_failures += 1
             if self.comms_failures >= COMMS_ABORT:
-                raise Abort(f"{self.comms_failures} position reads in a row "
-                            f"failed ({error})") from error
+                raise Abort(f"{self.comms_failures} 回連続で位置読み出しに失敗 "
+                            f"({error})") from error
             return None
 
-        load = self.read_one("Present_Load", 0)
+        self.history.append((now, pose))
+        self.history = [h for h in self.history if now - h[0] <= 3.0]
+
+        load = self.read_one("Present_Load", default=0)
         current = self.read_one("Present_Current")
         temperature = self.read_one("Present_Temperature")
         voltage = self.read_one("Present_Voltage")
@@ -414,101 +548,206 @@ class Watch:
         if current:
             self.current_ever_nonzero = True
 
-        error_deg = measured - commanded_deg
+        measured = pose[self.subject]
+        waypoint_target = self.waypoint.get(self.subject)
+        sent = self.sent.get(self.subject)
+        errors = {n: pose[n] - v for n, v in self.waypoint.items()}
+        worst_joint = (max(errors, key=lambda n: abs(errors[n]))
+                       if errors else self.subject)
+        stall = self.stall_reason(pose, now)
+
         row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timestamp": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"),
             "elapsed_s": round(now - self.started, 3),
-            "joint": JOINT, "direction": self.direction, "phase": phase,
-            "repeat": repeat, "target_deg": round(self.target_deg, 3),
-            "commanded_deg": round(commanded_deg, 3),
+            "phase": self.phase, "repeat": self.repeat,
+            "waypoint": self.waypoint_index, "subject": self.subject,
+            "nominal_target_deg": round(self.nominal, 3),
+            "waypoint_target_deg": (None if waypoint_target is None
+                                    else round(waypoint_target, 3)),
+            "sent_goal_deg": None if sent is None else round(sent, 3),
             "measured_deg": round(measured, 3),
-            "tracking_error_deg": round(error_deg, 3),
-            "load": load, "current": current,
-            "temperature_c": temperature,
+            "tracking_error_deg": (None if sent is None
+                                   else round(measured - sent, 3)),
+            "remaining_to_waypoint_deg": (None if waypoint_target is None else
+                                          round(waypoint_target - measured, 3)),
+            "remaining_to_nominal_deg": round(self.nominal - measured, 3),
+            "velocity_deg_s": round(self.velocity(pose, now), 3),
+            "load": load, "current": current, "temperature_c": temperature,
             "voltage_v": None if voltage is None else voltage / 10,
             "torque_enable": torque,
             "hold_time_s": None if hold_time is None else round(hold_time, 2),
+            "arrival": arrival, "stall": stall or "",
+            "max_joint_error_deg": (round(abs(errors[worst_joint]), 3)
+                                    if errors else None),
+            "worst_joint": worst_joint if errors else "",
+            **{f"{name}_deg": round(pose[name], 3) for name in ARM_JOINTS},
             "status": status, "notes": notes,
         }
         self.writer.writerow(row)
         self.rows.append(row)
-        self.history.append((now, measured, error_deg))
-        self.history = [h for h in self.history if now - h[0] <= 2.0]
-
-        self.judge(row, phase)
+        if judge:
+            self.judge(row, stall)
         return row
 
-    def judge(self, row, phase):
+    # -- deciding ---------------------------------------------------------
+
+    def stall_reason(self, pose, now):
+        """Which joint is short of its waypoint and no longer moving, if any.
+
+        This is the MOVING check, and it is not a tracking-error check. A joint
+        on its way to a waypoint is behind by design; a joint that has stopped
+        while still short of one is not on its way to anywhere.
+        """
+        if not self.waypoint:
+            self.stalled_since = None
+            return ""
+        stuck = []
+        for name, target in self.waypoint.items():
+            if abs(target - pose[name]) <= STALL_REMAINING_DEG:
+                continue
+            older = [h for h in self.history if now - h[0] >= STALL_WINDOW_S]
+            if not older:
+                continue
+            when, then = older[-1]
+            span = now - when
+            if span > 0 and abs(pose[name] - then[name]) / span < STALL_SPEED_DEG_S:
+                stuck.append(f"{name} {abs(target - pose[name]):.1f}deg short")
+        if not stuck:
+            self.stalled_since = None
+            return ""
+        if self.stalled_since is None:
+            self.stalled_since = now
+        if now - self.stalled_since >= STALL_PERSIST_S:
+            return ", ".join(stuck)
+        return ""
+
+    def judge(self, row, stall):
         load = abs(row["load"] or 0)
         if load > LOAD_ABORT:
-            raise Abort(f"load {row['load']} past {LOAD_ABORT} "
-                        f"(the sweep should sit near 40)")
+            raise Abort(f"負荷 {row['load']} が {LOAD_ABORT} を超えました"
+                        f"（この掃引の予測値は 40 前後）")
         temperature = row["temperature_c"]
         if temperature is not None and temperature > TEMPERATURE_ABORT_C:
-            raise Abort(f"{temperature} C past {TEMPERATURE_ABORT_C} C")
-        error = abs(row["tracking_error_deg"])
-        if error > TRACKING_ABORT_DEG:
-            raise Abort(f"tracking error {row['tracking_error_deg']:+.2f} deg "
-                        f"past {TRACKING_ABORT_DEG} deg")
+            raise Abort(f"温度 {temperature} C が {TEMPERATURE_ABORT_C} C を"
+                        f"超えました")
+        if stall:
+            raise Abort(f"目標へ進まなくなりました: {stall}"
+                        f"（{STALL_SPEED_DEG_S:.2f} deg/s 未満が "
+                        f"{STALL_WINDOW_S + STALL_PERSIST_S:.1f} s 継続）")
+        if self.waypoint:
+            self.check_retreat(row)
+        # HOLDING: only once a waypoint is confirmed reached does distance from
+        # it mean anything - and then it means a great deal.
+        if self.phase == "hold" and row["sent_goal_deg"] is not None:
+            if abs(row["measured_deg"] - row["sent_goal_deg"]) \
+                    > HOLD_ERROR_ABORT_DEG:
+                raise Abort(
+                    f"保持中に指令から {row['measured_deg'] - row['sent_goal_deg']:+.2f} "
+                    f"deg 外れました（上限 {HOLD_ERROR_ABORT_DEG:.1f} deg）")
 
-        # How fast the error is growing, over whatever the last second holds.
-        older = [h for h in self.history if row["elapsed_s"] is not None
-                 and self.history[-1][0] - h[0] >= 0.5]
-        if older:
-            span = self.history[-1][0] - older[-1][0]
-            grew = abs(self.history[-1][2]) - abs(older[-1][2])
-            if span > 0 and grew / span > TRACKING_RATE_ABORT_DEG_S:
-                raise Abort(f"tracking error growing at {grew/span:.1f} deg/s "
-                            f"past {TRACKING_RATE_ABORT_DEG_S} deg/s")
-
-        # Only while holding: a joint that is off its command and no longer
-        # moving has stopped answering. During a move, being behind is normal.
-        if phase == "hold" and error > STALL_ERROR_DEG:
-            window = [h for h in self.history
-                      if self.history[-1][0] - h[0] <= STALL_WINDOW_S]
-            if len(window) > 4:
-                moved = max(h[1] for h in window) - min(h[1] for h in window)
-                if moved < STALL_MOVEMENT_DEG:
-                    raise Abort(f"held {error:.2f} deg off its command without "
-                                f"moving for {STALL_WINDOW_S:.0f} s")
+    def check_retreat(self, row):
+        """Moving away from the waypoint is never a lag."""
+        remaining = row["remaining_to_waypoint_deg"]
+        if remaining is None:
+            return
+        now = time.perf_counter()
+        older = [r for r in self.rows
+                 if r["remaining_to_waypoint_deg"] is not None
+                 and r["waypoint"] == row["waypoint"]
+                 and row["elapsed_s"] - r["elapsed_s"] >= RETREAT_WINDOW_S]
+        if not older:
+            return
+        grew = abs(remaining) - abs(older[-1]["remaining_to_waypoint_deg"])
+        if grew > RETREAT_DEG:
+            raise Abort(f"目標から遠ざかっています: 残り "
+                        f"{abs(older[-1]['remaining_to_waypoint_deg']):.1f} → "
+                        f"{abs(remaining):.1f} deg")
 
 
 # -------------------------------------------------------------------------
 # moving
 # -------------------------------------------------------------------------
 
-def glide(robot, watch, goal, seconds, phase, repeat, log):
-    """Interpolate every commanded joint to `goal` over `seconds`, watching.
+def arrived(pose, target, tolerance):
+    """(ok, worst joint, its error) for a pose against a target pose."""
+    errors = {name: pose[name] - value for name, value in target.items()}
+    worst = max(errors, key=lambda n: abs(errors[n]))
+    return abs(errors[worst]) <= tolerance, worst, errors[worst]
 
-    Interpolated rather than commanded outright because a Feetech servo with
-    Goal_Velocity at the factory's 0 goes at whatever speed it can: one
-    Goal_Position write is a full-speed move. Small steps at a steady rate make
-    the speed a property of this loop, which can be stopped between any two of
-    them.
+
+def walk(robot, watch, path, phase, subject, nominal, repeat, speed, log,
+         label=""):
+    """Walk the waypoint list, confirming each one before sending the next.
+
+    Between waypoints the command is interpolated at 30 Hz so the servo is never
+    handed a step change; at each waypoint the arm is given time to actually get
+    there and is asked whether it did. A waypoint that does not arrive stops the
+    run - it does not become the next waypoint's starting point, which is how a
+    52 degree error walked into a phase that thought it had arrived.
     """
-    start = joints_of(robot)
-    steps = max(1, int(seconds * FPS))
-    sample_every = max(1, int(FPS / SAMPLE_HZ))
-    commanded = dict(start)
-    for step in range(1, steps + 1):
-        commanded = {name: start[name] + (value - start[name]) * step / steps
-                     for name, value in goal.items()}
-        sent = robot.send_action({f"{name}.pos": value
-                                  for name, value in commanded.items()})
-        if step % sample_every == 0 or step == steps:
-            watch.sample(phase, repeat,
-                         sent.get(f"{JOINT}.pos", commanded.get(JOINT, 0.0)))
-        time.sleep(1.0 / FPS)
-    return commanded
+    watch.reset(phase, subject, nominal, repeat)
+    for index, target in enumerate(path, 1):
+        watch.waypoint_index = index
+        watch.waypoint = dict(target)
+        start = joints_of(robot)
+        move = max((abs(target[n] - start[n]) for n in target), default=0.0)
+        steps = max(1, int(round(max(move / speed, 1.0 / FPS) * FPS)))
+        for step in range(1, steps + 1):
+            watch.sent = {n: start[n] + (target[n] - start[n]) * step / steps
+                          for n in target}
+            robot.send_action({f"{n}.pos": v for n, v in watch.sent.items()})
+            time.sleep(1.0 / FPS)
+            if step % max(1, int(FPS / SAMPLE_HZ)) == 0:
+                watch.sample()
+
+        # Now it has been asked for the whole step. Give it time to get there,
+        # and say so either way.
+        watch.sent = dict(target)
+        deadline = time.perf_counter() + WAYPOINT_TIMEOUT_S
+        while True:
+            row = watch.sample()
+            pose = joints_of(robot) if row is None else {
+                n: row[f"{n}_deg"] for n in ARM_JOINTS}
+            ok, worst, error = arrived(pose, target, ARRIVE_DEG)
+            if ok:
+                watch.sample(arrival="reached")
+                break
+            if time.perf_counter() > deadline:
+                watch.sample(arrival="timeout", status="abort", judge=False)
+                raise Abort(
+                    f"waypoint {index}/{len(path)} に {WAYPOINT_TIMEOUT_S:.0f} s "
+                    f"以内に到達しませんでした: {worst} が {error:+.2f} deg ずれ"
+                    f"（許容 {ARRIVE_DEG:.1f} deg）")
+            time.sleep(1.0 / SAMPLE_HZ)
+
+    # The phase as a whole, once everything has settled.
+    time.sleep(0.4)
+    pose = joints_of(robot)
+    goal = dict(path[-1])
+    ok, worst, error = arrived(pose, goal, PHASE_TOLERANCE_DEG)
+    watch.sample(arrival="phase ok" if ok else "phase FAILED")
+    log(f"    {pad(label or phase, 30)}到達判定 "
+        f"{'OK' if ok else '*** 未到達 ***'}  最悪 {worst} {error:+.2f} deg"
+        f"（許容 {PHASE_TOLERANCE_DEG:.1f} deg）")
+    for name in sorted(goal):
+        log(f"      {pad(name, 16)}目標 {goal[name]:+7.2f}   実測 "
+            f"{pose[name]:+7.2f}   差 {pose[name] - goal[name]:+6.2f} deg")
+    if not ok:
+        raise Abort(f"{label or phase} が到達しませんでした: {worst} が "
+                    f"{error:+.2f} deg ずれ（許容 {PHASE_TOLERANCE_DEG:.1f} deg）")
+    return pose
 
 
-def hold(robot, watch, commanded_deg, seconds, repeat, log):
-    """Sit at the commanded angle and keep sampling. Returns the samples."""
+def hold_at(robot, watch, target_deg, seconds, repeat, log):
+    """Sit at a confirmed waypoint and keep sampling. Returns the samples."""
+    watch.reset("hold", JOINT, target_deg, repeat)
+    watch.waypoint = {JOINT: target_deg}
+    watch.sent = {JOINT: target_deg}
     began = time.perf_counter()
     taken = []
     while time.perf_counter() - began < seconds:
-        row = watch.sample("hold", repeat, commanded_deg,
-                           hold_time=time.perf_counter() - began)
+        row = watch.sample(hold_time=time.perf_counter() - began)
         if row is not None:
             taken.append(row)
         time.sleep(1.0 / SAMPLE_HZ)
@@ -521,7 +760,7 @@ def summarise(rows, label):
 
     if not rows:
         return {"label": label, "samples": 0}
-    error = np.array([abs(r["tracking_error_deg"]) for r in rows])
+    error = np.array([abs(r["tracking_error_deg"] or 0.0) for r in rows])
     load = np.array([abs(r["load"] or 0) for r in rows])
     measured = np.array([r["measured_deg"] for r in rows])
     temps = [r["temperature_c"] for r in rows if r["temperature_c"] is not None]
@@ -545,17 +784,10 @@ def summarise(rows, label):
 # the report that comes before anything moves
 # -------------------------------------------------------------------------
 
-def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
+def plan_report(args, arm, posture, stages, out_dir, lock_path, log, clear):
     wrist = arm[JOINT]
     target = args.to
-    ticks = ticks_for(target, arm)
-    to_min = target - wrist["min_deg"]
-    to_max = wrist["max_deg"] - target
-    operational = LIMIT_DEG
-    goal = dict(posture, wrist_flex=SAFE_DEG)
-    biggest = max(abs(goal[name] - arm[name]["deg"]) for name in goal)
-    unfold_s, rest_s = transit_times(biggest)
-    wrist_s = max(3.0, abs(target - SAFE_DEG) / WRIST_SPEED_DEG_S)
+    upright = dict(posture, wrist_flex=SAFE_DEG)
 
     log("\n  --- いまアームがいる場所（読み取りのみ。トルクには触れていません）---")
     log("    " + pad("joint", 15) + rpad("現在角", 9) + rpad("ticks", 8)
@@ -570,52 +802,82 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
     log("    " + pad("joint", 15) + rpad("現在", 9) + rpad("目標", 9)
         + rpad("移動量", 11))
     for name in ARM_JOINTS:
-        goal = SAFE_DEG if name == JOINT else posture[name]
-        log(f"    {name:<15}{arm[name]['deg']:>+9.2f}{goal:>+9.2f}"
-            f"{goal - arm[name]['deg']:>+11.2f}")
-    log(f"    単一関節の最大移動量 {biggest:+.2f} deg")
+        log(f"    {name:<15}{arm[name]['deg']:>+9.2f}{upright[name]:>+9.2f}"
+            f"{upright[name] - arm[name]['deg']:>+11.2f}")
 
-    log("\n  --- wrist_flex の目標 ---")
-    log(f"    {pad('目標角', 28)}{target:+.2f} deg   ({ticks:.0f} ticks)")
-    log(f"    {pad('ファームウェア下限', 28)}{wrist['min_deg']:+.2f} deg   "
-        f"({wrist['min_ticks']} ticks)   余裕 {to_min:+.2f} deg")
-    log(f"    {pad('ファームウェア上限', 28)}{wrist['max_deg']:+.2f} deg   "
-        f"({wrist['max_ticks']} ticks)   余裕 {to_max:+.2f} deg")
-    log(f"    {pad('R1 の上限', 28)}{operational:+.2f} deg   "
-        f"余裕 {operational - abs(target):+.2f} deg")
-    log(f"    {pad('プランナの運用限界', 28)}{wrist['max_deg'] - 5.0:+.2f} deg"
-        f"（実可動域から安全マージン 5 deg を引いたもの）")
-    log("                                このスクリプトは書き換えません")
+    log("\n  --- 送信する waypoint 列（ツインが再生したものと同一）---")
+    total = 0
+    for label, path in stages:
+        total += len(path)
+        biggest = 0.0
+        previous = None
+        for point in path:
+            if previous is not None:
+                biggest = max(biggest, max(abs(point[n] - previous[n])
+                                           for n in point))
+            previous = point
+        log(f"    {pad(label, 30)}{len(path):>4} 点   1 点あたり最大 "
+            f"{biggest:.2f} deg")
+    log(f"    {pad('合計', 30)}{total:>4} 点   "
+        f"いずれも到達確認してから次を送ります")
 
-    log("\n  --- 速度と時間 ---")
-    log(f"    {pad(f'展開（最初の {100*BREAKOUT_FRACTION:.0f}%）', 28)}"
-        f"{unfold_s:.1f} s / {BREAKOUT_SPEED_DEG_S:.1f} deg/s、"
-        f"ここでいったん停止して待ちます")
-    log(f"    {pad('残りの移動', 28)}{rest_s:.1f} s / "
-        f"{TRANSIT_SPEED_DEG_S:.0f} deg/s、{FPS} Hz で補間")
-    log(f"    {pad(f'wrist_flex {SAFE_DEG:+.0f} → {target:+.0f}', 28)}"
-        f"{wrist_s:.1f} s / {WRIST_SPEED_DEG_S:.0f} deg/s")
-    log(f"    {pad('保持', 28)}{args.hold:.1f} s、{SAMPLE_HZ} Hz で記録")
-    log(f"    {pad('反復', 28)}{args.repeats} 回"
-        f"（間に {SAFE_DEG:+.0f} deg へ戻します）")
-    total = (unfold_s + rest_s + args.repeats * (2 * wrist_s + args.hold)
-             + unfold_s + rest_s)
-    log(f"    {pad('動いている時間の目安', 28)}{total:.0f} s")
-    log(f"    {pad('Goal_Velocity 書き込み', 28)}{GOAL_VELOCITY_DEG_S:.0f} deg/s "
-        f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s)、終了時に 0 へ戻します")
-    log(f"    {pad('max_relative_target', 28)}{MAX_RELATIVE_TARGET_DEG:.1f} deg "
-        f"／ 1 指令")
+    if not args.posture_only:
+        log("\n  --- wrist_flex の目標 ---")
+        log(f"    {pad('目標角', 28)}{target:+.2f} deg   "
+            f"({ticks_for(target, arm):.0f} ticks)")
+        log(f"    {pad('ファームウェア下限', 28)}{wrist['min_deg']:+.2f} deg   "
+            f"({wrist['min_ticks']} ticks)   余裕 "
+            f"{target - wrist['min_deg']:+.2f} deg")
+        log(f"    {pad('ファームウェア上限', 28)}{wrist['max_deg']:+.2f} deg   "
+            f"({wrist['max_ticks']} ticks)   余裕 "
+            f"{wrist['max_deg'] - target:+.2f} deg")
+        log(f"    {pad('R1 の上限', 28)}{LIMIT_DEG:+.2f} deg   "
+            f"余裕 {LIMIT_DEG - abs(target):+.2f} deg")
+        log("\n    joint 角 → servo 生位置の換算 "
+            f"（0 deg = calibration 中点 {wrist['mid_ticks']:.0f} ticks）")
+        for deg in sorted({0.0, target / 2, target}):
+            log(f"      {deg:+8.2f} deg  →  {ticks_for(deg, arm):8.1f} ticks")
+
+    log("\n  --- 速度と刻み ---")
+    log(f"    {pad('waypoint 間隔', 28)}{STEP_DEG:.1f} deg（最速関節基準）")
+    log(f"    {pad('waypoint 到達判定', 28)}±{ARRIVE_DEG:.1f} deg 以内、"
+        f"最大 {WAYPOINT_TIMEOUT_S:.0f} s 待つ")
+    log(f"    {pad('phase 到達判定', 28)}全関節 ±{PHASE_TOLERANCE_DEG:.1f} deg 以内")
+    log(f"    {pad('waypoint 間の補間', 28)}{FPS} Hz、"
+        f"展開 {BREAKOUT_SPEED_DEG_S:.1f} / 移動 {TRANSIT_SPEED_DEG_S:.0f} / "
+        f"手首 {WRIST_SPEED_DEG_S:.0f} deg/s")
+    log(f"    {pad('Goal_Velocity', 28)}{GOAL_VELOCITY_DEG_S:.0f} deg/s "
+        f"({GOAL_VELOCITY_DEG_S * TICKS_PER_DEG:.0f} ticks/s)、"
+        f"終了時に 0 へ戻します")
+    log(f"    {pad('max_relative_target', 28)}使用しません（None）")
+    log("      前回はこれが 2.0 deg で、サーボが見る位置偏差を 2 deg に抑え、")
+    log("      トルクを頭打ちにして elbow_flex を 52.8 deg 手前で止めました。")
+    log("      速度は補間と Goal_Velocity で決めます。")
+    if not args.posture_only:
+        log(f"    {pad('保持', 28)}{args.hold:.1f} s、{SAMPLE_HZ} Hz で記録")
+        log(f"    {pad('反復', 28)}{args.repeats} 回")
 
     log("\n  --- 走行を止める条件 ---")
-    log(f"    {pad('|Present_Load|', 28)}> {LOAD_ABORT} / 1023   "
-        f"（ツインの予測は 40 前後）")
-    log(f"    {pad('追従誤差', 28)}> {TRACKING_ABORT_DEG:.1f} deg")
-    log(f"    {pad('追従誤差の増加率', 28)}> {TRACKING_RATE_ABORT_DEG_S:.1f} deg/s")
-    log(f"    {pad('温度', 28)}> {TEMPERATURE_ABORT_C} C"
+    log("    [移動中]")
+    log(f"      {pad('前進の停止', 26)}waypoint まで "
+        f"{STALL_REMAINING_DEG:.1f} deg 以上残して "
+        f"{STALL_SPEED_DEG_S:.2f} deg/s 未満が "
+        f"{STALL_WINDOW_S + STALL_PERSIST_S:.1f} s 継続")
+    log(f"      {pad('逆行', 26)}残距離が {RETREAT_DEG:.1f} deg 以上増えた")
+    log(f"      {pad('waypoint 未到達', 26)}{WAYPOINT_TIMEOUT_S:.0f} s 以内に "
+        f"±{ARRIVE_DEG:.1f} deg に入らない")
+    log(f"      {pad('', 26)}（残り {STALL_REMAINING_DEG:.1f} deg 未満で"
+        f"止まった場合はこちらが捕まえます）")
+    log("      追従誤差の大きさそのものでは停止しません。移動中に遅れるのは")
+    log("      当然で、止まっていることのほうが異常だからです。")
+    log("    [保持中]")
+    log(f"      {pad('指令からのずれ', 26)}> {HOLD_ERROR_ABORT_DEG:.1f} deg")
+    log("    [いつでも]")
+    log(f"      {pad('|Present_Load|', 26)}> {LOAD_ABORT} / 1023"
+        f"（この掃引の予測値は 40 前後）")
+    log(f"      {pad('温度', 26)}> {TEMPERATURE_ABORT_C} C"
         f"（現在 {wrist['temperature']} C）")
-    log(f"    {pad('連続した読み出し失敗', 28)}>= {COMMS_ABORT} 回")
-    log(f"    {pad('指令から外れたまま静止', 28)}> {STALL_ERROR_DEG:.1f} deg のずれで "
-        f"{STALL_MOVEMENT_DEG:.1f} deg も動かない状態が {STALL_WINDOW_S:.0f} s")
+    log(f"      {pad('連続読み出し失敗', 26)}>= {COMMS_ABORT} 回")
     log("    いずれも「ここまでは安全」という意味ではありません。異常を早く")
     log("    止めるための上限です。異音・振動・不自然な動きがあれば、数値が")
     log("    条件を満たしていなくても止めてください。")
@@ -623,17 +885,10 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
     log("\n  --- 条件に触れたとき何が起きるか ---")
     log("    1. 全関節の Present_Position を ticks で読む")
     log("    2. Goal_Position をその Present_Position へ書き換える")
-    log("       → アームは「いまいる場所」を保持します。補間を止めるだけでは、")
-    log("         直前の指令がサーボに残り、追従できなかったその指令に押し")
-    log("         続けることになります。")
     log("    3. 以降の軌道指令は出しません")
-    log("    4. トルクは ON のまま（上げた腕を解放すれば落下します）")
-    log("    5. 全関節の位置・指令・負荷・温度・電圧・トルク状態を表示し、")
-    log("       summary.json に保存します")
-    log("    そのうえで問いかけます。異常停止のあと腕を畳むには 'home' の")
-    log("    入力が必要です。ENTER だけなら保持したままにします。")
-    log("    バスが応答しない場合はその旨を表示し、scripts/torque_off.py を")
-    log("    案内します。それが正しい唯一の場面です。")
+    log("    4. トルクは ON のまま、その場を保持します")
+    log("    5. 全関節の状態を表示し、summary.json に保存します")
+    log("    そのあと、収納するかどうかは人が決めます（home の入力が必要）。")
 
     log("\n  --- 書き込み先 ---")
     log(f"    {pad('出力ディレクトリ', 28)}{out_dir}"
@@ -642,8 +897,8 @@ def plan_report(args, arm, posture, out_dir, lock_path, log, sim_clear):
     log(f"    {pad('既存の結果', 28)}上書きしません。実行ごとに別ディレクトリです")
 
     log("\n  --- この計画に対するツインの判定 ---")
-    log(f"    {'問題なし' if sim_clear else '*** 干渉あり — 実行を拒否します ***'}")
-    return sim_clear
+    log(f"    {'問題なし' if clear else '*** 干渉あり — 実行を拒否します ***'}")
+    return clear
 
 
 def git_state():
@@ -664,9 +919,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="wrist_flex の 1 つの角度が実用できるかを確認します。"
                     "意図的に、1 回の実行につき 1 角度だけです。")
-    parser.add_argument("--to", type=float, required=True, metavar="DEG",
+    parser.add_argument("--to", type=float, metavar="DEG",
                         help=f"確認する wrist_flex の角度。"
                              f"-{LIMIT_DEG:.0f}..+{LIMIT_DEG:.0f}")
+    parser.add_argument("--posture-only", action="store_true",
+                        help="姿勢へ行って到達を確認し、戻るだけ。手首は振りません")
     parser.add_argument("--dry-run", action="store_true",
                         help="計画を表示するだけで、何も動かしません")
     parser.add_argument("--posture", choices=sorted(POSTURES), default="upright",
@@ -679,18 +936,22 @@ def main():
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
+    if args.posture_only:
+        args.to = 0.0
+    elif args.to is None:
+        raise SystemExit("\n  --to か --posture-only のどちらかを指定してください\n")
     if abs(args.to) > LIMIT_DEG:
         raise SystemExit(
-            f"\n  {args.to:+.1f} deg は R1 が許す ±{LIMIT_DEG:.0f} deg の"
-            f"外側です。\n  上書きするフラグはありませんし、ここに足すべきでも"
-            f"ありません。\n  この先は、サーボ自身の停止位置まで 6 deg を"
-            f"切ります。\n")
+            f"\n  {args.to:+.1f} deg は R1 が許す ±{LIMIT_DEG:.0f} deg の外側です。"
+            f"\n  上書きするフラグはありませんし、ここに足すべきでもありません。"
+            f"\n  この先は、サーボ自身の停止位置まで 6 deg を切ります。\n")
     if args.repeats < 1:
         raise SystemExit("  --repeats は 1 以上にしてください")
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    direction = "pos" if args.to >= 0 else "neg"
-    out_dir = args.out / f"{stamp}_{direction}{abs(args.to):.0f}"
+    what = ("posture" if args.posture_only
+            else f"{'pos' if args.to >= 0 else 'neg'}{abs(args.to):.0f}")
+    out_dir = args.out / f"{stamp}_{what}"
     lock_path = args.out / ".lock"
 
     from so101.hardware import resolve as resolve_port
@@ -698,19 +959,24 @@ def main():
 
     with only_one(lock_path):
         log = Log()
-        log(f"\n  Phase R1: wrist_flex {args.to:+.1f} deg、姿勢 "
-            f"{args.posture!r}、ポート {port}")
+        log(f"\n  Phase R1: "
+            + (f"姿勢確認のみ（{args.posture}）" if args.posture_only
+               else f"wrist_flex {args.to:+.1f} deg、姿勢 {args.posture!r}")
+            + f"、ポート {port}")
         log("  " + ("DRY RUN — 何も動かしません" if args.dry_run
                     else "LIVE — 実機が動きます"))
 
         arm = read_arm(port)
-        posture = dict(POSTURES[args.posture])
+        posture = POSTURES[args.posture]
+        start = {name: arm[name]["deg"] for name in ARM_JOINTS}
+        stages = stages_for(start, posture, args.to, args.repeats,
+                            args.posture_only, args.posture)
 
-        log("\n  --- MuJoCo ツインで計画を検査します ---")
-        start_deg = {name: arm[name]["deg"] for name in ARM_JOINTS}
-        clear = sim_check(start_deg, posture, args.to, log)
+        log("\n  --- 送信する waypoint 列を、そのまま MuJoCo で再生します ---")
+        clear = replay(stages, start, log)
 
-        ok = plan_report(args, arm, posture, out_dir, lock_path, log, clear)
+        ok = plan_report(args, arm, posture, stages, out_dir, lock_path, log,
+                         clear)
         if args.dry_run:
             log("\n  Dry run です。何も動かさず、何も書き込んでいません。\n")
             return
@@ -718,10 +984,10 @@ def main():
             raise SystemExit(
                 "\n  ツインがこの計画に干渉を報告しました。実行を拒否します。\n")
 
-        run(args, arm, posture, port, out_dir, log)
+        run(args, arm, posture, stages, port, out_dir, log)
 
 
-def run(args, arm, posture, port, out_dir, log):
+def run(args, arm, posture, stages, port, out_dir, log):
     """Everything from here on moves the arm."""
     import numpy as np  # noqa: F401 - summarise needs it; fail early if absent
 
@@ -767,42 +1033,58 @@ def run(args, arm, posture, port, out_dir, log):
     writer = csv.DictWriter(handle, fieldnames=Watch.FIELDS)
     writer.writeheader()
 
-    robot = None
-    watch = None
+    robot = watch = None
     aborted = None
     home = {name: arm[name]["deg"] for name in ARM_JOINTS}
     goal_velocity = int(GOAL_VELOCITY_DEG_S * TICKS_PER_DEG)
+    upright = dict(posture, wrist_flex=SAFE_DEG)
     result = {
-        "phase": "R1", "joint": JOINT, "target_deg": args.to,
-        "direction": "positive" if args.to >= 0 else "negative",
-        "posture": args.posture, "posture_deg": posture,
+        "phase": "R1", "joint": JOINT,
+        "test": "posture only" if args.posture_only else f"{args.to:+.0f} deg",
+        "target_deg": None if args.posture_only else args.to,
+        "direction": ("none" if args.posture_only
+                      else "positive" if args.to >= 0 else "negative"),
+        "posture": args.posture, "posture_deg": upright,
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "port": port, "repeats_requested": args.repeats,
-        "hold_s": args.hold,
+        "port": port, "repeats_requested": args.repeats, "hold_s": args.hold,
         "home_pose_deg": {k: round(v, 2) for k, v in home.items()},
+        "servo": {
+            "mid_ticks": arm[JOINT]["mid_ticks"],
+            "limit_ticks": [arm[JOINT]["min_ticks"], arm[JOINT]["max_ticks"]],
+            "limit_deg": [round(arm[JOINT]["min_deg"], 2),
+                          round(arm[JOINT]["max_deg"], 2)],
+            "target_ticks": (None if args.posture_only
+                             else round(ticks_for(args.to, arm), 1)),
+        },
         "thresholds": {
             "load_abort": LOAD_ABORT,
-            "tracking_abort_deg": TRACKING_ABORT_DEG,
-            "tracking_rate_abort_deg_s": TRACKING_RATE_ABORT_DEG_S,
             "temperature_abort_c": TEMPERATURE_ABORT_C,
             "comms_abort": COMMS_ABORT,
+            "stall_remaining_deg": STALL_REMAINING_DEG,
+            "stall_speed_deg_s": STALL_SPEED_DEG_S,
+            "stall_window_s": STALL_WINDOW_S,
+            "stall_persist_s": STALL_PERSIST_S,
+            "retreat_deg": RETREAT_DEG,
+            "hold_error_abort_deg": HOLD_ERROR_ABORT_DEG,
+            "waypoint_timeout_s": WAYPOINT_TIMEOUT_S,
         },
         "motion": {
+            "step_deg": STEP_DEG, "arrive_deg": ARRIVE_DEG,
+            "phase_tolerance_deg": PHASE_TOLERANCE_DEG,
             "wrist_speed_deg_s": WRIST_SPEED_DEG_S,
             "transit_speed_deg_s": TRANSIT_SPEED_DEG_S,
+            "breakout_speed_deg_s": BREAKOUT_SPEED_DEG_S,
             "goal_velocity_ticks_s": goal_velocity,
-            "goal_velocity_deg_s": GOAL_VELOCITY_DEG_S,
-            "max_relative_target_deg": MAX_RELATIVE_TARGET_DEG,
+            "max_relative_target_deg": MAX_RELATIVE_TARGET,
             "fps": FPS, "p_coefficient": tuning.p_coefficient(),
         },
-        "git": git_state(),
-        "holds": [],
+        "git": git_state(), "arrivals": [], "holds": [],
     }
 
     try:
         robot = make_robot_from_config(SO101FollowerConfig(
             port=port, id="follower",
-            max_relative_target=MAX_RELATIVE_TARGET_DEG))
+            max_relative_target=MAX_RELATIVE_TARGET))
         robot.connect()
         log("\n  接続しました。トルクが入り、アームはその場を保持しています")
 
@@ -810,70 +1092,71 @@ def run(args, arm, posture, port, out_dir, log):
             robot.bus.write("Goal_Velocity", name, goal_velocity)
         log(f"  アーム 5 関節の Goal_Velocity を {goal_velocity} ticks/s "
             f"({GOAL_VELOCITY_DEG_S:.0f} deg/s) に設定しました")
+        log(f"  max_relative_target は使用していません（{MAX_RELATIVE_TARGET}）")
 
-        watch = Watch(robot, writer, log, args.to)
+        watch = Watch(robot, writer, log)
         here = joints_of(robot)
-        log("  読み戻し: "
-            + "、".join(f"{n} {here[n]:+.1f}" for n in ARM_JOINTS))
+        log("  読み戻し: " + "、".join(f"{n} {here[n]:+.1f}" for n in ARM_JOINTS))
 
-        # -- 1. to the posture --------------------------------------------
-        goal = dict(posture, wrist_flex=SAFE_DEG)
-        biggest = max(abs(goal[n] - here[n]) for n in goal)
-        unfold_s, rest_s = transit_times(biggest)
-        log(f"\n  --- {args.posture!r} へ移動します。最大移動量 "
-            f"{biggest:.1f} deg ---")
-        log(f"  2 段に分けます。最初の {100*BREAKOUT_FRACTION:.0f}% "
-            f"({biggest * BREAKOUT_FRACTION:.1f} deg) は "
-            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s。")
-        log("  そこが、自身に寄りかかった姿勢から抜け出す区間だからです。")
-        log(f"  残りは {TRANSIT_SPEED_DEG_S:.0f} deg/s。")
+        breakout, to_posture = stages[0], stages[1]
+
+        log(f"\n  --- {pad('1. ' + breakout[0], 26)}{len(breakout[1])} 点、"
+            f"{BREAKOUT_SPEED_DEG_S:.1f} deg/s ---")
+        log("  自身に寄りかかった姿勢から抜け出す区間です。")
         if input("  動かすなら ENTER（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
-
-        part = {n: here[n] + (goal[n] - here[n]) * BREAKOUT_FRACTION
-                for n in goal}
-        glide(robot, watch, part, unfold_s, "unfold", 0, log)
-        broke_out = joints_of(robot)
-        log("  折り畳みから抜けました: "
-            + "、".join(f"{n} {broke_out[n]:+.2f}" for n in ARM_JOINTS))
+        walk(robot, watch, breakout[1], "unfold", "shoulder_lift",
+             breakout[1][-1]["shoulder_lift"], 0, BREAKOUT_SPEED_DEG_S, log,
+             label=breakout[0])
         log(f"    wrist_flex  負荷 {watch.rows[-1]['load']}、"
-            f"{watch.rows[-1]['temperature_c']} C、"
-            f"追従誤差 {watch.rows[-1]['tracking_error_deg']:+.2f} deg")
+            f"{watch.rows[-1]['temperature_c']} C")
         if input("  異常がなければ ENTER で継続（それ以外は中止）: ").strip():
             raise KeyboardInterrupt
 
-        glide(robot, watch, goal, rest_s, "transit", 0, log)
-        arrived = joints_of(robot)
-        log("  到着: " + "、".join(f"{n} {arrived[n]:+.2f}" for n in ARM_JOINTS))
-        result["posture_reached_deg"] = {n: round(arrived[n], 2)
+        log(f"\n  --- {pad('2. ' + to_posture[0], 26)}{len(to_posture[1])} 点、"
+            f"{TRANSIT_SPEED_DEG_S:.0f} deg/s ---")
+        if input("  動かすなら ENTER（それ以外は中止）: ").strip():
+            raise KeyboardInterrupt
+        reached = walk(robot, watch, to_posture[1], "transit", "shoulder_lift",
+                       upright["shoulder_lift"], 0, TRANSIT_SPEED_DEG_S, log,
+                       label=to_posture[0])
+        result["posture_reached_deg"] = {n: round(reached[n], 2)
                                          for n in ARM_JOINTS}
+        result["upright_reached"] = True
+        log("\n  UPRIGHT_REACHED — 全関節が許容範囲内です")
+        result["arrivals"].append({"phase": "upright", "ok": True,
+                                   "pose": result["posture_reached_deg"]})
 
-        # -- 2. the angle, more than once ---------------------------------
-        wrist_s = max(3.0, abs(args.to - SAFE_DEG) / WRIST_SPEED_DEG_S)
-        for repeat in range(1, args.repeats + 1):
-            log(f"\n  --- {repeat}/{args.repeats} 回目: "
-                f"{SAFE_DEG:+.0f} → {args.to:+.1f} deg を {wrist_s:.1f} s で ---")
-            if input("  進めるなら ENTER（それ以外は中止）: ").strip():
-                raise KeyboardInterrupt
+        if not args.posture_only:
+            for repeat in range(1, args.repeats + 1):
+                out_stage = stages[2 + 2 * (repeat - 1)]
+                back_stage = stages[3 + 2 * (repeat - 1)]
+                log(f"\n  --- {repeat}/{args.repeats} 回目: "
+                    f"{SAFE_DEG:+.0f} → {args.to:+.1f} deg、"
+                    f"{len(out_stage[1])} 点 ---")
+                if input("  進めるなら ENTER（それ以外は中止）: ").strip():
+                    raise KeyboardInterrupt
+                walk(robot, watch, out_stage[1], "approach", JOINT, args.to,
+                     repeat, WRIST_SPEED_DEG_S, log, label=out_stage[0])
 
-            glide(robot, watch, {JOINT: args.to}, wrist_s, "approach", repeat, log)
-            taken = hold(robot, watch, args.to, args.hold, repeat, log)
-            stats = summarise(taken, f"hold {repeat}")
-            result["holds"].append(stats)
-            log(f"    静定角 {stats['measured_mean_deg']:+.2f} deg"
-                f"（保持中のぶれ {stats['measured_drift_deg']:.2f} deg）")
-            log(f"    追従誤差  平均 {stats['tracking_error_mean_deg']:.2f}"
-                f"  中央 {stats['tracking_error_median_deg']:.2f}"
-                f"  p95 {stats['tracking_error_p95_deg']:.2f}"
-                f"  最大 {stats['tracking_error_worst_deg']:.2f} deg")
-            log(f"    負荷      平均 {stats['load_mean']:.0f}"
-                f"  p95 {stats['load_p95']:.0f}"
-                f"  最大 {stats['load_worst']} / 1023")
-            log(f"    温度      {stats['temperature_start_c']} → "
-                f"{stats['temperature_end_c']} C")
+                taken = hold_at(robot, watch, args.to, args.hold, repeat, log)
+                stats = summarise(taken, f"hold {repeat}")
+                result["holds"].append(stats)
+                log(f"    静定角 {stats['measured_mean_deg']:+.2f} deg"
+                    f"（保持中のぶれ {stats['measured_drift_deg']:.2f} deg）")
+                log(f"    追従誤差  平均 {stats['tracking_error_mean_deg']:.2f}"
+                    f"  中央 {stats['tracking_error_median_deg']:.2f}"
+                    f"  p95 {stats['tracking_error_p95_deg']:.2f}"
+                    f"  最大 {stats['tracking_error_worst_deg']:.2f} deg")
+                log(f"    負荷      平均 {stats['load_mean']:.0f}"
+                    f"  p95 {stats['load_p95']:.0f}"
+                    f"  最大 {stats['load_worst']} / 1023")
+                log(f"    温度      {stats['temperature_start_c']} → "
+                    f"{stats['temperature_end_c']} C")
 
-            log(f"    {SAFE_DEG:+.0f} deg へ戻します")
-            glide(robot, watch, {JOINT: SAFE_DEG}, wrist_s, "return", repeat, log)
+                log(f"    {SAFE_DEG:+.0f} deg へ戻します")
+                walk(robot, watch, back_stage[1], "return", JOINT, SAFE_DEG,
+                     repeat, WRIST_SPEED_DEG_S, log, label=back_stage[0])
 
         result["current_register_ever_nonzero"] = watch.current_ever_nonzero
         if not watch.current_ever_nonzero:
@@ -897,7 +1180,7 @@ def run(args, arm, posture, port, out_dir, log):
         result["finished_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds")
         if robot is not None:
-            park(robot, watch, home, goal_velocity, log, aborted)
+            park(robot, watch, home, log, aborted)
             try:
                 robot.disconnect()
                 log("  切断しました。トルクを解放しました")
@@ -907,7 +1190,7 @@ def run(args, arm, posture, port, out_dir, log):
         handle.close()
         verdict(result, args, log)
         (out_dir / "summary.json").write_text(
-            json.dumps(result, indent=2), encoding="utf-8")
+            json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
         log(f"\n  全サンプル  {samples_path}")
         log(f"  まとめ      {out_dir / 'summary.json'}")
         log.close()
@@ -927,10 +1210,8 @@ def freeze(robot, log, watch=None, reason=""):
     meet. Whatever stopped it, it keeps pulling against.
 
     So the goal is overwritten with the present position, all six joints at
-    once, before anything is reported or decided. The arm then holds where it
-    actually is rather than where it was last told to be. Torque stays on: this
-    is the wrong moment to drop a raised arm, and dropping it is what releasing
-    torque means.
+    once, before anything is reported or decided. Torque stays on: this is the
+    wrong moment to drop a raised arm.
 
     Ticks rather than degrees, in both directions. A degree round-trip goes
     through the calibration midpoint and back and lands a tick or two out, and
@@ -980,7 +1261,7 @@ def freeze(robot, log, watch=None, reason=""):
                                               num_retry=FREEZE_RETRIES), 3)
         except Exception:  # noqa: BLE001
             row["deg"] = None
-        if row["voltage"] is not None:
+        if row.get("voltage") is not None:
             row["voltage_v"] = row.pop("voltage") / 10
         state["joints"][name] = row
         log(f"    {name:<15}"
@@ -991,8 +1272,7 @@ def freeze(robot, log, watch=None, reason=""):
 
     if watch is not None:
         try:
-            watch.sample("frozen", 0, state["joints"][JOINT]["deg"] or 0.0,
-                         status="abort", notes=reason)  # noqa: E501
+            watch.sample(status="abort", notes=reason, judge=False)
         except Exception:  # noqa: BLE001 - the record is not worth a second fault
             pass
     log("\n  アームは保持しています。どうするか決める前に、見て、音を"
@@ -1000,7 +1280,7 @@ def freeze(robot, log, watch=None, reason=""):
     return state
 
 
-def park(robot, watch, home, goal_velocity, log, aborted=None):
+def park(robot, watch, home, log, aborted=None):
     """Wrist to zero, arm back to where it was resting, then let go.
 
     The order is the point. Releasing torque with the arm straight up drops it
@@ -1018,9 +1298,8 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
             # pressing ENTER.
             log(f"  この実行は途中で止まりました: {aborted}")
             log("  理由が分かるまで、動かすのは安全ではありません。")
-            answer = input("  畳むなら home と入力（それ以外は保持のまま）: "
-                           ).strip().lower()
-            if answer != "home":
+            if input("  畳むなら home と入力（それ以外は保持のまま）: "
+                     ).strip().lower() != "home":
                 log("  保持したままにします（トルク ON）。電源を切る前に"
                     "下ろしてください。")
                 log("  準備ができたら:  uv run scripts/torque_off.py COM4")
@@ -1036,15 +1315,14 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
         return
 
     try:
-        here = joints_of(robot)
-        if watch is not None:
-            watch.sample("park", 0, here[JOINT], notes="before parking")
-        glide_home = max(8.0, max(abs(home[n] - here[n]) for n in home)
-                         / TRANSIT_SPEED_DEG_S)
         # Straighten the wrist before folding the arm, so the gripper is not
-        # swung through anything on the way down.
-        _quiet_glide(robot, {JOINT: SAFE_DEG}, 4.0)
-        _quiet_glide(robot, dict(home), glide_home)
+        # swung through anything on the way down. Walked, like everything else.
+        here = joints_of(robot)
+        _quiet_walk(robot, waypoints(here, {JOINT: SAFE_DEG}),
+                    WRIST_SPEED_DEG_S)
+        here = joints_of(robot)
+        _quiet_walk(robot, waypoints(here, {n: home[n] for n in ARM_JOINTS}),
+                    TRANSIT_SPEED_DEG_S)
         log("  収納しました")
     except Exception as error:  # noqa: BLE001 - parking must not itself fail
         log(f"  正常に収納できませんでした: {error}")
@@ -1060,26 +1338,43 @@ def park(robot, watch, home, goal_velocity, log, aborted=None):
     log("  Goal_Velocity を 0 へ戻しました")
 
 
-def _quiet_glide(robot, goal, seconds):
-    """Interpolate without sampling or judging - used on the way out."""
-    start = joints_of(robot)
-    steps = max(1, int(seconds * FPS))
-    for step in range(1, steps + 1):
-        robot.send_action({f"{name}.pos": start[name]
-                           + (value - start[name]) * step / steps
-                           for name, value in goal.items()})
-        time.sleep(1.0 / FPS)
+def _quiet_walk(robot, path, speed):
+    """Walk a waypoint list without sampling or judging - used on the way out."""
+    for target in path:
+        start = joints_of(robot)
+        move = max((abs(target[n] - start[n]) for n in target), default=0.0)
+        steps = max(1, int(round(max(move / speed, 1.0 / FPS) * FPS)))
+        for step in range(1, steps + 1):
+            robot.send_action({
+                f"{n}.pos": start[n] + (target[n] - start[n]) * step / steps
+                for n in target})
+            time.sleep(1.0 / FPS)
+        deadline = time.perf_counter() + WAYPOINT_TIMEOUT_S
+        while time.perf_counter() < deadline:
+            if arrived(joints_of(robot), target, ARRIVE_DEG)[0]:
+                break
+            time.sleep(1.0 / SAMPLE_HZ)
 
 
 def verdict(result, args, log):
     """What the run showed. Not a joint limit - R1 does not decide one."""
-    holds = result.get("holds", [])
-    side = "正側" if result["direction"] == "positive" else "負側"
-    log(f"\n  === wrist_flex {args.to:+.1f} deg（{side}）===")
+    log(f"\n  === {result['test']}（{args.posture}）===")
     if result.get("aborted"):
         log(f"  完了しませんでした: {result['aborted']}")
         result["verdict"] = "aborted"
         return
+    if args.posture_only:
+        log("  UPRIGHT_REACHED: " + ("はい" if result.get("upright_reached")
+                                     else "いいえ"))
+        for name, value in result.get("posture_reached_deg", {}).items():
+            log(f"    {pad(name, 16)}{value:+7.2f} deg")
+        result["verdict"] = ("ordinary" if result.get("upright_reached")
+                             else "review")
+        log("  → " + ("姿勢へ到達し、戻りました" if result["verdict"] == "ordinary"
+                      else "確認が必要です"))
+        return
+
+    holds = result.get("holds", [])
     if len(holds) < args.repeats:
         log(f"  {args.repeats} 回中 {len(holds)} 回しか完了していません")
         result["verdict"] = "incomplete"
