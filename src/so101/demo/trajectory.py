@@ -423,11 +423,14 @@ def connect(robot, port="COM4", attempts=3, log=print):
             except Exception:  # noqa: BLE001 - it may never have opened
                 pass
             if attempt == attempts:
-                raise SystemExit(
-                    f"\n  アーム({port}) に接続できません。\n"
-                    "  電源と USB を確認してください。読み取りだけなら\n"
-                    f"    uv run scripts/diag.py {port}\n"
-                    "  で応答が見えます。\n")
+                # Unsafe, not SystemExit. SystemExit inherits from
+                # BaseException, so `except Exception` does not catch it: in the
+                # screen's worker thread it killed the thread without queueing a
+                # failure, and the colour buttons - which are only re-enabled by
+                # a "done" or "failed" update - stayed greyed out for good.
+                raise Unsafe(
+                    f"アーム({port}) に接続できません。電源と USB を確認して"
+                    f"ください（読み取りだけなら uv run scripts/diag.py {port}）")
             time.sleep(1.5)
 
 

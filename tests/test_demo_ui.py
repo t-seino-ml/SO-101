@@ -261,6 +261,7 @@ def test_a_colour_press_is_ignored_while_the_arm_is_moving(ui):
     class Pressed:
         colour_enabled = False
         worker = None
+        _lingering = None
         started = []
         start_pick = ui.DemoApp.start_pick
 
@@ -277,6 +278,65 @@ def test_a_colour_press_is_ignored_while_the_arm_is_moving(ui):
     app.colour_enabled = True
     app.start_pick("red")
     assert len(app.started) == 1
+
+
+def test_a_worker_that_dies_still_leaves_the_screen_pressable(ui):
+    """The wedge: a colour pressed, and nothing pressable ever again.
+
+    `connect` raised SystemExit, which does not inherit from Exception, so the
+    worker's `except Exception` let it past. The thread died without queueing
+    anything, and the colour buttons - which only come back on a "done" or a
+    "failed" - stayed greyed out until the screen was left.
+    """
+    import queue
+
+    class Exploding:
+        slot_map = object()            # past the first guard
+        cameras = None
+        follower_port = "COM4"
+        _pick_worker = ui.DemoApp._pick_worker
+
+        def __init__(self):
+            self.updates = queue.Queue()
+
+        def _load_detector(self):
+            raise SystemExit("connect gave up")
+
+    app = Exploding()
+    app._pick_worker("red")            # must not propagate
+
+    kinds = []
+    while True:
+        try:
+            kinds.append(app.updates.get_nowait().kind)
+        except queue.Empty:
+            break
+    assert "ready" in kinds, \
+        "the worker must hand the screen back however it died"
+    assert "failed" in kinds, "and say what happened"
+
+
+def test_ready_re_enables_the_colours(ui):
+    """The other half: the screen has to act on it."""
+    import queue
+
+    class Screen:
+        mode = "pick"
+        enabled = None
+        chosen_slot = "slot3"
+        _drain_once = ui.DemoApp._drain_once
+
+        def __init__(self):
+            self.updates = queue.Queue()
+            self.updates.put(ui.Update("ready"))
+
+        def _set_buttons(self, enabled):
+            self.enabled = enabled
+
+    screen = Screen()
+    screen._drain_once()
+    assert screen.enabled is True
+    assert screen.chosen_slot is None
 
 
 def test_stop_does_nothing_when_there_is_nothing_to_stop(ui):

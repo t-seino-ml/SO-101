@@ -370,6 +370,7 @@ class DemoApp(tk.Tk):
         self.updates = queue.Queue()
         self.stop_flag = threading.Event()
         self.worker = None
+        self._lingering = None     # a worker that would not stop
         self.cameras = None
         self.detector = None
         self.slot_map = None
@@ -766,7 +767,8 @@ class DemoApp(tk.Tk):
                     time.sleep(1.5)
             robot = make_robot_from_config(
                 SO101FollowerConfig(port=follower, id="follower"))
-            connect(robot, follower, log=lambda line: None)
+            connect(robot, follower,
+                    log=lambda line: self.updates.put(Update("detail", line.strip())))
             self.updates.put(Update("done", "動かせます"))
             self.updates.put(Update(
                 "detail", "もう一方のアームを手で動かしてください"))
@@ -786,7 +788,7 @@ class DemoApp(tk.Tk):
                     time.sleep(0.1)
                     continue
                 time.sleep(max(0.0, 1 / 60 - (time.perf_counter() - started)))
-        except Exception as error:  # noqa: BLE001
+        except BaseException as error:  # noqa: BLE001 - see _pick_worker
             self.updates.put(Update("failed", f"{type(error).__name__}: {error}"))
         finally:
             for device in (teleop, robot):
@@ -936,6 +938,11 @@ class DemoApp(tk.Tk):
             return
         if self.worker is not None and self.worker.is_alive():
             return
+        if self._lingering is not None and self._lingering.is_alive():
+            self._state("前の動作がまだアームを持っています。"
+                        "数秒待ってもう一度押してください", theme.WARN)
+            return
+        self._lingering = None
         self._set_buttons(False)
         self.chosen_slot = None
         self.start_worker(lambda: self._pick_worker(colour))
@@ -998,7 +1005,12 @@ class DemoApp(tk.Tk):
 
             robot = make_robot_from_config(
                 SO101FollowerConfig(port=port, id="follower"))
-            connect(robot, port, log=lambda line: None)
+            # read_limits has just closed this port. Windows does not always
+            # hand it back the instant the handle drops, and reopening into that
+            # gap looks exactly like an arm that is not plugged in.
+            time.sleep(0.4)
+            connect(robot, port,
+                    log=lambda line: self.updates.put(Update("detail", line.strip())))
 
             def confirm(point):
                 if self.stop_flag.is_set():
@@ -1020,7 +1032,12 @@ class DemoApp(tk.Tk):
             self.updates.put(Update("failed", str(error)))
             if robot is not None:
                 freeze(robot, log=lambda line: None)
-        except Exception as error:  # noqa: BLE001
+        except BaseException as error:  # noqa: BLE001
+            # BaseException on purpose. `except Exception` let SystemExit and
+            # KeyboardInterrupt past, the thread died without queueing anything,
+            # and the colour buttons - which only come back on "done" or
+            # "failed" - stayed greyed out until the screen was left. Whatever
+            # went wrong, the visitor must be able to press a colour again.
             self.updates.put(Update(
                 "failed", f"{type(error).__name__}: {error}"))
             if robot is not None:
@@ -1032,6 +1049,9 @@ class DemoApp(tk.Tk):
                 except Exception:  # noqa: BLE001
                     pass
             self.updates.put(Update("detail", "アームを解放しました"))
+            # The belt to the braces above: no path out of this worker may
+            # leave the screen with nothing pressable.
+            self.updates.put(Update("ready"))
 
     # -- the loops the screen runs on -------------------------------------
 
@@ -1041,9 +1061,22 @@ class DemoApp(tk.Tk):
         self.worker.start()
 
     def stop_worker(self, timeout=6.0):
+        """Ask the worker to stop, and remember if it would not.
+
+        It used to drop the reference either way. A worker blocked on a serial
+        read still holds the port after the join times out, and the next one
+        opens the same port and fails at connect - which reads on screen as an
+        arm that is not plugged in, rather than as the previous run not having
+        let go yet.
+        """
         self.stop_flag.set()
-        if self.worker is not None and self.worker.is_alive():
-            self.worker.join(timeout=timeout)
+        worker = self.worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=timeout)
+            if worker.is_alive():
+                self._lingering = worker
+                self.updates.put(Update(
+                    "detail", "前の動作がまだ終わっていません"))
         self.worker = None
 
     def _state(self, text, colour):
@@ -1102,6 +1135,11 @@ class DemoApp(tk.Tk):
                         self.chosen_slot = None
                 elif update.kind == "failed":
                     self._state(update.text, theme.BAD)
+                    if self.mode == "pick":
+                        self._set_buttons(True)
+                        self.chosen_slot = None
+                elif update.kind == "ready":
+                    # Sent from the worker's `finally`, whatever happened.
                     if self.mode == "pick":
                         self._set_buttons(True)
                         self.chosen_slot = None

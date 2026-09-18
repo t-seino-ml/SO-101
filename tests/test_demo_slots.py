@@ -535,5 +535,10 @@ def test_the_connect_gives_up_and_says_where_to_look():
         def disconnect(self):
             pass
 
-    with pytest.raises(SystemExit, match="diag.py"):
+    # Unsafe, not SystemExit. SystemExit does not inherit from Exception, so
+    # every `except Exception` around a connect - the screen's worker thread,
+    # the teaching script's save-what-you-have handler - let it straight past.
+    with pytest.raises(Unsafe, match="diag.py"):
+        connect(Dead(), "COM4", attempts=2, log=lambda *_: None)
+    with pytest.raises(Exception):      # i.e. an ordinary handler catches it
         connect(Dead(), "COM4", attempts=2, log=lambda *_: None)
