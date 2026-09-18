@@ -414,3 +414,28 @@ def test_a_bus_that_stays_down_still_stops_the_run():
 
     with pytest.raises(ConnectionError):
         play(Dead(POSE), _trajectory(shoulder_pan=12.0), log=lambda *_: None)
+
+
+def test_a_residual_the_servo_cannot_close_is_not_an_obstacle():
+    """Slot 6 stopped over the can, 0.17 deg outside tolerance, block gripped.
+
+    A waypoint that only moves a degree or two never overcomes the stiction, so
+    the error sits there and refuses to shrink. That is the hardware, not
+    something in the way, and it must not read as a crash.
+    """
+    from so101.demo.trajectory import ARRIVE_DEG, STUCK_MIN_DEG
+
+    class Stiff(FakeRobot):
+        """Leaves a residual smaller than the obstacle threshold."""
+
+        def send_action(self, action):
+            for key, value in action.items():
+                name = key.removesuffix(".pos")
+                self.pose[name] = float(value) - (
+                    ARRIVE_DEG * 0.9 if name == "elbow_flex" else 0.0)
+            return dict(action)
+
+    assert ARRIVE_DEG * 0.9 < STUCK_MIN_DEG, "the residual must be below it"
+    records = play(Stiff(POSE), _trajectory(elbow_flex=60.0),
+                   log=lambda *_: None)
+    assert len(records) == 2, "a residual inside tolerance is an arrival"

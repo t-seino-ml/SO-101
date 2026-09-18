@@ -53,7 +53,14 @@ DEFAULT_SETTLE_S = 0.35
 #: close the gap - `so101.policy.motion` says the same thing about Cartesian
 #: moves and measured most of a centimetre. Measured here: elbow_flex 2.6 deg
 #: short at PREGRASP, arm extended forward.
-ARRIVE_DEG = 1.5
+#: 1.5 was too tight to be useful. After a correction the joints land within a
+#: degree, but a waypoint that only moves a degree or two never gets going -
+#: the servo's stiction swallows the command and the error sits where it is.
+#: Slot 6 reached the can, gripped, carried, and stopped 0.17 deg outside
+#: tolerance with the jaws still shut and the block still in them. Two and a
+#: half degrees is comfortably inside what a grasp needs and comfortably
+#: outside what the hardware does on its own.
+ARRIVE_DEG = 2.5
 ARRIVE_TIMEOUT_S = 4.0
 #: How many times to aim again, adding the miss back into the command.
 #:
@@ -68,6 +75,10 @@ SETTLE_SECONDS = 0.45
 #: joint held by something is not short because it sagged, and adding its error
 #: back round after round would just lean on whatever is stopping it.
 MAX_CORRECTION_DEG = 8.0
+#: Below this, an error that will not shrink is the servo's deadband rather
+#: than something in the way, and the waypoint's own timeout is the right
+#: thing to catch it. An obstacle holds a joint tens of degrees from its goal.
+STUCK_MIN_DEG = 3.0
 #: How much further to close the jaws than the taught angle.
 #:
 #: Teaching recorded where the block stopped the jaws. Commanding exactly that
@@ -513,9 +524,13 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
                     f"{point.phase}: {corrections} 回補正しても到達せず。"
                     f"{worst} が {errors[worst]:+.2f} deg ずれ"
                     f"（許容 {arrive_deg:.1f}）")
-            # Not shrinking means something is holding it, and leaning harder on
-            # that is the wrong answer.
+            # Not shrinking means something is holding it, and leaning harder
+            # on that is the wrong answer - but only when there is something to
+            # shrink. A degree and a half that will not move is the servo's
+            # deadband; an obstacle shows as tens of degrees that stay put.
+            # Judging the two alike stopped a pick with the block over the can.
             if previous_worst is not None \
+                    and abs(errors[worst]) > STUCK_MIN_DEG \
                     and abs(errors[worst]) > previous_worst - 0.2:
                 raise Unsafe(
                     f"{point.phase}: 補正しても誤差が縮みません"
