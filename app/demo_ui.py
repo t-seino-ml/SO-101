@@ -248,7 +248,7 @@ def _plates(canvas, plates, size):
         return canvas
     picture = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(picture)
-    pad = max(4, size // 3)
+    pad = max(3, size // 5)
     for x, y, text, colour in plates:
         box = draw.textbbox((0, 0), text, font=font)
         width, height = box[2] - box[0], box[3] - box[1]
@@ -296,8 +296,16 @@ def annotate(image, detections, slot_map, chosen=None, shown_width=None):
         colour = BGR.get(detection.colour, (200, 200, 200))
         cv2.rectangle(canvas, (x0, y0), (x1, y1), colour, thick)
         plates.append((x0, y0,
-                       JAPANESE.get(detection.colour, detection.colour), colour))
-    return _plates(canvas, plates, int(17 * scale)) if plates else canvas
+                       JAPANESE.get(detection.colour, detection.colour), colour,
+                       y1 - y0))
+    # Sized against the panel so it survives the downscale, but capped against
+    # the box: six blocks in a cluster put six name plates in the same corner,
+    # and a plate wider than the block it names buries its neighbours.
+    if not plates:
+        return canvas
+    tightest = min((p[4] for p in plates), default=40)
+    return _plates(canvas, [p[:4] for p in plates],
+                   int(max(11.0, min(13.0 * scale, tightest * 0.85)))) 
 
 
 # -------------------------------------------------------------------------
