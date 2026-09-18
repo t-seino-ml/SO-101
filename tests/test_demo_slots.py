@@ -95,13 +95,21 @@ def test_a_sane_trajectory_passes():
 
 
 class FakeBus:
-    def __init__(self, robot, load=30):
+    """Answers the two sync reads `health` makes, and the one `freeze` makes."""
+
+    def __init__(self, robot, load=30, gripper_load=None):
         self.robot, self.load = robot, load
+        self.gripper_load = load if gripper_load is None else gripper_load
 
     def read(self, register, motor, normalize=True, num_retry=0):
         return {"Present_Load": self.load, "Present_Temperature": 40}[register]
 
     def sync_read(self, register, normalize=True, num_retry=0):
+        if register == "Present_Load":
+            return {name: (self.gripper_load if name == "gripper" else self.load)
+                    for name in self.robot.pose}
+        if register == "Present_Temperature":
+            return {name: 40 for name in self.robot.pose}
         return {name: 2047 for name in self.robot.pose}
 
     def sync_write(self, register, values, normalize=True, num_retry=0):
@@ -276,12 +284,7 @@ def test_a_gripped_block_is_not_mistaken_for_a_crash():
     class Gripping(FakeRobot):
         def __init__(self, pose):
             super().__init__(pose)
-            self.bus.read = self._read
-
-        def _read(self, register, motor, normalize=True, num_retry=0):
-            if register == "Present_Load":
-                return 500 if motor == "gripper" else 30
-            return 40
+            self.bus.gripper_load = 500
 
         def send_action(self, action):
             super().send_action(action)
@@ -383,3 +386,31 @@ def test_a_releasing_phase_never_squeezes():
     plan = squeeze_plan(trajectory)
     assert plan[1] < 25.0 and plan[2] < 25.0, "CLOSE and LIFT hold"
     assert plan[3] == 25.0, "DROP does not, whatever the numbers say"
+
+
+def test_a_dropped_packet_does_not_end_the_run():
+    """Both arms sit behind USB bridges and either can garble a reply."""
+    class Flaky(FakeRobot):
+        def __init__(self, pose):
+            super().__init__(pose)
+            self.calls = 0
+
+        def get_observation(self):
+            self.calls += 1
+            if self.calls == 2:      # one bad frame, partway in
+                raise ConnectionError("[TxRxResult] There is no status packet!")
+            return super().get_observation()
+
+    robot = Flaky(POSE)
+    records = play(robot, _trajectory(shoulder_pan=12.0), log=lambda *_: None)
+    assert len(records) == 2, "one bad packet must not end the pick"
+
+
+def test_a_bus_that_stays_down_still_stops_the_run():
+    """Retrying is not ignoring: a dead bus is still a dead bus."""
+    class Dead(FakeRobot):
+        def get_observation(self):
+            raise ConnectionError("[TxRxResult] There is no status packet!")
+
+    with pytest.raises(ConnectionError):
+        play(Dead(POSE), _trajectory(shoulder_pan=12.0), log=lambda *_: None)

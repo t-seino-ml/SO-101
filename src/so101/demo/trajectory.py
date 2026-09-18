@@ -314,33 +314,59 @@ def read_limits(port):
     return out
 
 
+#: A dropped packet is not a fault. Both arms sit behind CH343 USB bridges and
+#: either can garble a reply - the whole of `so101.hardware.bus_patch` exists
+#: because of it, and its retries do not reach every path. What must not happen
+#: is a demonstration ending because one packet went missing.
+READ_ATTEMPTS = 4
+READ_PAUSE_S = 0.08
+
+
+def _retrying(what, attempts=READ_ATTEMPTS):
+    """Call `what()`, retrying a dropped packet. Raises the last failure."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return what()
+        except Exception:  # noqa: BLE001 - one bad packet is not a fault
+            if attempt == attempts:
+                raise
+            time.sleep(READ_PAUSE_S)
+
+
 def joints_of(robot):
     """The arm's pose, as {joint: degrees}."""
+    observation = _retrying(robot.get_observation)
     return {key.removesuffix(".pos"): float(value)
-            for key, value in robot.get_observation().items()
+            for key, value in observation.items()
             if key.endswith(".pos")}
 
 
 def health(robot):
     """(worst arm |load|, its joint, worst temperature, gripper |load|).
 
+    Two bus transactions, not twelve. Reading each joint's load and temperature
+    one register at a time put some two hundred and sixty transactions a second
+    on the bus during the arrival wait, on top of the thirty-hertz write that is
+    doing the moving, and it gave out with "no status packet" partway through a
+    pick. A sync read asks all six at once, which is what it is for.
+
     The gripper's load is returned beside the arm's rather than among it,
     because the two mean opposite things. An arm joint under load has met
     something it should not have; the gripper under load is holding the block.
     """
-    load, where, temperature, grip = 0, None, 0, 0
-    for name in (*ARM_JOINTS, "gripper"):
-        try:
-            value = abs(robot.bus.read("Present_Load", name, normalize=False))
-            temperature = max(temperature, robot.bus.read(
-                "Present_Temperature", name, normalize=False))
-        except Exception:  # noqa: BLE001 - a dropped packet is not a fault
-            continue
-        if name == "gripper":
-            grip = value
-        elif value > load:
-            load, where = value, name
-    return load, where, temperature, grip
+    try:
+        loads = _retrying(lambda: robot.bus.sync_read(
+            "Present_Load", normalize=False))
+        temperatures = _retrying(lambda: robot.bus.sync_read(
+            "Present_Temperature", normalize=False))
+    except Exception:  # noqa: BLE001 - reported as unknown, never as a fault
+        return 0, None, 0, 0
+    grip = abs(loads.get("gripper", 0))
+    arm = {name: abs(value) for name, value in loads.items()
+           if name in ARM_JOINTS}
+    where = max(arm, key=arm.get) if arm else None
+    return (arm.get(where, 0), where, max(temperatures.values(), default=0),
+            grip)
 
 
 def freeze(robot, log=print):
