@@ -76,7 +76,7 @@ def test_the_overlay_survives_having_nothing_to_draw(ui):
     assert ui.annotate(blank, None, None).shape == blank.shape
 
 
-def test_a_panel_fills_exactly_the_space_it_was_given(ui):
+def test_a_panel_fills_exactly_the_space_it_was_given(ui, drawn):
     """A placeholder that is not panel-sized leaves a hole or overruns the card.
 
     It also has to exist at all: the panels used to be Labels, which size
@@ -84,19 +84,9 @@ def test_a_panel_fills_exactly_the_space_it_was_given(ui):
     asked for 470 characters and swallowed the window for as long as the
     detector took to load.
     """
-    import tkinter as tk
-
-    try:
-        root = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no display")
-    try:
-        root.withdraw()
-        for size in (ui.TELEOP_VIEW, ui.PICK_VIEW):
-            image = ui.placeholder(size)
-            assert (image.width(), image.height()) == size
-    finally:
-        root.destroy()
+    for size in (ui.TELEOP_VIEW, ui.PICK_VIEW):
+        image = ui.placeholder(size)
+        assert (image.width(), image.height()) == size
 
 
 @pytest.mark.parametrize("width,height", [(1560, 940), (1366, 768),
@@ -187,6 +177,79 @@ def test_clearing_a_screen_drops_the_panels_it_owned(ui):
     after = source.index('self.canvas.delete("all")')
     assert before < after, \
         "views must be dropped before the items are deleted, not after"
+
+
+@pytest.fixture(scope="module")
+def drawn(ui):
+    """One real window, with no cameras and no serial ports, for hit testing.
+
+    Module-scoped because Tk will not give this build a second root once the
+    first has been destroyed: a per-test window made every later GUI test skip
+    itself with "Tcl wasn't installed properly", which is not what was wrong.
+    """
+    import tkinter as tk
+
+    class Dry(ui.DemoApp):
+        def _start_up(self):
+            pass
+
+        def _load_detector(self):
+            return None
+
+        def start_worker(self, target):
+            pass
+
+    try:
+        app = Dry()
+    except tk.TclError as error:
+        pytest.skip(f"no display: {error}")
+    app.withdraw()
+    app.update()
+    try:
+        yield app
+    finally:
+        app.destroy()
+
+
+def _tag_at(app, x, y):
+    """Every tag on the topmost item under that point, as Tk sees them."""
+    found = app.canvas.find_overlapping(x - 1, y - 1, x + 1, y + 1)
+    tags = set()
+    for item in found:
+        tags.update(app.canvas.gettags(item))
+    return tags
+
+
+def test_everything_meant_to_be_clicked_carries_the_tag_it_was_bound_to(ui, drawn):
+    """A canvas tag is a Tcl list, so a tag with a space in it is several tags.
+
+    The mode cards were tagged "mode:01 / TELEOP". Tk stored that as three tags,
+    `tag_bind` on the whole string matched none of them, and the home screen had
+    no way off it: neither mode could be selected.
+    """
+    width, height = drawn.size()
+
+    drawn.show_home()
+    drawn.update()
+    card_w = min(430, (width - 3 * ui.MARGIN) / 2)
+    left = (width - 2 * card_w - ui.GAP * 2) / 2
+    centres = {"mode:teleop": left + card_w / 2,
+               "mode:pick": left + card_w + ui.GAP * 2 + card_w / 2}
+    for tag, x in centres.items():
+        assert tag in _tag_at(drawn, x, height * 0.33 + 40), \
+            f"nothing under the {tag} card answers to that tag"
+
+    drawn.show_pick()
+    drawn.update()
+    plan = ui.pick_layout(width, height)
+    x0, y0, x1, y1 = plan["stop"]
+    assert "stop" in _tag_at(drawn, (x0 + x1) / 2, y0 + 40)
+    sx0, sy0, sx1, sy1 = plan["select"]
+    tile_w = (sx1 - sx0 - 52 - 5 * 12) / 6
+    for index, colour in enumerate(ui.COLOURS):
+        x = sx0 + 26 + index * (tile_w + 12) + tile_w / 2
+        assert f"tile:{colour}" in _tag_at(drawn, x, sy0 + 92 + 20), \
+            f"the {colour} tile is not clickable"
 
 
 def test_a_colour_press_is_ignored_while_the_arm_is_moving(ui):

@@ -565,13 +565,13 @@ class DemoApp(tk.Tk):
         top = height * 0.33
         left = (width - 2 * card_w - GAP * 2) / 2
         self._mode_card((left, top, left + card_w, top + card_h),
-                        "01 / TELEOP", "リーダ機で動かす",
+                        "teleop", "01 / TELEOP", "リーダ機で動かす",
                         "もう一方のアームを手で動かすと\n"
                         "ロボットが同じ形について来ます",
                         theme.ACCENT, self.show_teleop)
         second = left + card_w + GAP * 2
         self._mode_card((second, top, second + card_w, top + card_h),
-                        "02 / PICK & PLACE", "ブロックをつかむ",
+                        "pick", "02 / PICK & PLACE", "ブロックをつかむ",
                         "色を選ぶと、カメラがその色を探して\n"
                         "ロボットが缶に入れます",
                         theme.GOOD, self.show_pick)
@@ -580,9 +580,17 @@ class DemoApp(tk.Tk):
             width / 2, height - 36, text=self.detail_text, font=self.f_body,
             fill=theme.FAINT)
 
-    def _mode_card(self, rect, tag, title, blurb, accent, command):
+    def _mode_card(self, rect, key, tag, title, blurb, accent, command):
+        """One of the two choices on the home screen.
+
+        `key` is the canvas tag and `tag` is the label, and they are separate
+        arguments because the label has spaces in it. A canvas tag is a Tcl
+        list: tagging six items "mode:01 / TELEOP" tagged them "mode:01", "/"
+        and "TELEOP", `tag_bind` on the whole string matched nothing, and
+        neither card could be clicked.
+        """
         x0, y0, x1, y1 = rect
-        name = f"mode:{tag}"
+        name = f"mode:{key}"
         box = theme.rounded(self.canvas, x0, y0, x1, y1, 18, fill=theme.CARD,
                             outline=theme.EDGE, tags=name)
         self.canvas.create_rectangle(x0 + 28, y0 + 32, x0 + 60, y0 + 35,
