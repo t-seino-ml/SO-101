@@ -156,10 +156,19 @@ def main():
         for index, a in enumerate(names) for b in names[index + 1:])
     print(f"\n  いちばん近い 2 つ: {closest[1]} と {closest[2]} が "
           f"{closest[0]:.0f} px")
-    if closest[0] < 2 * args.radius:
-        print(f"  *** 受け入れ半径 {args.radius:.0f} px の円が重なります。")
-        print(f"      Slot をもっと離すか、--radius を {closest[0]/2:.0f} 未満に "
-              f"してください ***")
+    # Fitted rather than announced. Whether the slots look 45 px apart or 300
+    # depends entirely on where the camera ended up, and working the radius out
+    # by hand is one more thing to get wrong at a venue five minutes before the
+    # doors open. Eight tenths of half the closest gap keeps the circles apart.
+    if closest[0] < 2 * slot_map.acceptance_radius_px:
+        fitted = round(0.8 * closest[0] / 2)
+        print(f"  受け入れ半径 {args.radius:.0f} px では円が重なるので "
+              f"{fitted} px にしました")
+        print("    （もっと広げたいときは Slot 自体を離してください）")
+        slot_map.acceptance_radius_px = float(fitted)
+    print(f"  受け入れ半径 {slot_map.acceptance_radius_px:.0f} px、"
+          f"どちらとも言えないと判定する差 "
+          f"{slot_map.ambiguity_margin_px:.0f} px")
 
     if args.out.is_file():
         backup = args.out.with_name(

@@ -439,3 +439,65 @@ def test_a_residual_the_servo_cannot_close_is_not_an_obstacle():
     records = play(Stiff(POSE), _trajectory(elbow_flex=60.0),
                    log=lambda *_: None)
     assert len(records) == 2, "a residual inside tolerance is an arrival"
+
+
+class Detection:
+    def __init__(self, pixel, colour="blue", confidence=0.9):
+        self.pixel, self.colour, self.confidence = pixel, colour, confidence
+
+
+class FakeDetector:
+    def __init__(self, detections):
+        self.detections = detections
+
+    def detect(self, image, colours=None):
+        return [d for d in self.detections
+                if colours is None or d.colour in colours]
+
+
+class FakeStream:
+    def read(self):
+        return type("Frame", (), {"image": None})()
+
+
+def _bench():
+    """The exhibition as it stands: six slots 45 px apart, spares off to one side."""
+    return SlotMap(slots={"slot1": (318.0, 391.0), "slot2": (349.0, 336.0),
+                          "slot3": (372.0, 297.0), "slot4": (374.0, 412.0),
+                          "slot5": (399.0, 355.0), "slot6": (419.0, 311.0)},
+                   acceptance_radius_px=18.0)
+
+
+def test_blocks_off_the_slots_are_not_candidates():
+    """A spare blue on the bench made a perfectly clear scene unanswerable."""
+    from so101.demo.slots import steady_centre
+
+    slots = _bench()
+    detector = FakeDetector([Detection((348.0, 340.0)),     # in slot2
+                             Detection((560.0, 106.0))])    # 249 px from any
+    centre, detail = steady_centre(detector, FakeStream(), "blue", frames=3,
+                                   log=lambda *_: None, slot_map=slots)
+    assert centre is not None, detail.get("why")
+    assert slots.nearest(centre)[0] == "slot2"
+    assert detail["ignored_outside_slots"] == 1
+
+
+def test_two_blocks_of_one_colour_in_slots_is_still_refused():
+    """Ignoring the spares must not have ignored a real ambiguity."""
+    from so101.demo.slots import steady_centre
+
+    detector = FakeDetector([Detection((348.0, 340.0)),     # slot2
+                             Detection((372.0, 297.0))])    # slot3
+    centre, detail = steady_centre(detector, FakeStream(), "blue", frames=3,
+                                   log=lambda *_: None, slot_map=_bench())
+    assert centre is None
+    assert "2 個" in detail["why"]
+
+
+def test_the_ambiguity_margin_follows_the_layout():
+    """45 px apart in the image: a fixed 25 px margin refuses everything."""
+    slots = _bench()
+    assert slots.ambiguity_margin_px < 10, "must be small for slots this close"
+    for name, centre in slots.slots.items():
+        assert slots.nearest(centre)[0] == name
+        assert not slots.ambiguous(centre), f"{name} reads as ambiguous"

@@ -97,7 +97,8 @@ def look(args, log, record):
 
         centre, detail = steady_centre(detector, stream, args.color,
                                        frames=args.frames,
-                                       confidence=args.confidence, log=log)
+                                       confidence=args.confidence, log=log,
+                                       slot_map=slot_map)
         record["detection"] = detail
         image = stream.read().image.copy()
         record["_image"] = image

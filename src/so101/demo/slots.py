@@ -67,7 +67,19 @@ class SlotMap:
                        for name, centre in self.slots.items()),
                       key=lambda pair: pair[1])
 
-    def ambiguous(self, pixel, margin_px=25.0):
+    @property
+    def ambiguity_margin_px(self):
+        """How much nearer one slot must be than the next to be the answer.
+
+        Taken from the acceptance radius rather than fixed, because how far
+        apart the slots look depends entirely on where the camera is. Six slots
+        on this bench sit 45 px apart in the image; a fixed 25 px margin would
+        have called almost every detection ambiguous, and the same number would
+        be far too lax with the camera closer.
+        """
+        return self.acceptance_radius_px * 0.4
+
+    def ambiguous(self, pixel, margin_px=None):
         """Are the two nearest slots too close together to choose between?
 
         A block exactly between two slots should stop the run rather than be
@@ -76,7 +88,12 @@ class SlotMap:
         order = self.ranked(pixel)
         if len(order) < 2:
             return False
-        return (order[1][1] - order[0][1]) < margin_px
+        margin = self.ambiguity_margin_px if margin_px is None else margin_px
+        return (order[1][1] - order[0][1]) < margin
+
+    def holds(self, pixel):
+        """Is this detection inside any slot at all?"""
+        return self.nearest(pixel)[0] is not None
 
     def number(self, name):
         """"slot2" -> 2, for finding the trajectory file."""
@@ -125,7 +142,7 @@ class SlotMap:
 
 
 def steady_centre(detector, stream, colour, frames=7, confidence=0.5,
-                  log=print):
+                  log=print, slot_map=None):
     """The median bbox centre of one colour over several frames.
 
     One frame is one detection and detections jitter; the median of seven costs
@@ -134,32 +151,43 @@ def steady_centre(detector, stream, colour, frames=7, confidence=0.5,
     two blocks of the same colour swapping which is "first" between frames looks
     exactly like one block jumping across the table.
 
+    With a `slot_map`, only detections sitting in a slot are candidates. Blocks
+    elsewhere in view - a supply tray, the ones already in the can, a spare on
+    the bench - are not answers to "which slot is the blue one in", and counting
+    them made a perfectly clear scene read as "two blue blocks, cannot choose".
+
     Returns (centre, detail). `centre` is None when there is nothing to act on,
     and `detail["why"]` says what a person should be told.
     """
     import numpy as np
 
-    seen, counts = [], []
+    seen, counts, ignored = [], [], 0
     for _ in range(frames):
         image = stream.read().image
         found = [d for d in detector.detect(image, colours=[colour])
                  if d.confidence >= confidence]
+        if slot_map is not None:
+            inside = [d for d in found if slot_map.holds(d.pixel)]
+            ignored = max(ignored, len(found) - len(inside))
+            found = inside
         counts.append(len(found))
         if found:
             best = max(found, key=lambda d: d.confidence)
             seen.append((best.pixel[0], best.pixel[1], best.confidence))
-    detail = {"frames": frames, "seen_in": len(seen),
-              "counts": counts, "colour": colour}
+    detail = {"frames": frames, "seen_in": len(seen), "counts": counts,
+              "colour": colour, "ignored_outside_slots": ignored}
     if not seen:
-        detail["why"] = f"{colour} のブロックが見つかりません"
+        detail["why"] = (f"{colour} のブロックが Slot の上に見つかりません"
+                         if ignored else
+                         f"{colour} のブロックが見つかりません")
         return None, detail
     if len(seen) < frames * 0.6:
         detail["why"] = (f"{colour} が {frames} フレーム中 {len(seen)} 枚でしか"
                          f"見えません（検出が不安定です）")
         return None, detail
     if max(counts) > 1:
-        detail["why"] = (f"{colour} のブロックが {max(counts)} 個見えます。"
-                         f"どれを取るか決められません")
+        detail["why"] = (f"{colour} のブロックが Slot の上に {max(counts)} 個 "
+                         f"あります。どれを取るか決められません")
         return None, detail
 
     array = np.array(seen)
@@ -169,8 +197,10 @@ def steady_centre(detector, stream, colour, frames=7, confidence=0.5,
     detail.update({"centre_px": [round(centre[0], 1), round(centre[1], 1)],
                    "spread_px": round(spread, 1),
                    "confidence": round(float(np.median(array[:, 2])), 3)})
-    if spread > 60.0:
+    wobble = 60.0 if slot_map is None else max(
+        12.0, slot_map.acceptance_radius_px * 0.8)
+    if spread > wobble:
         detail["why"] = (f"{colour} の検出位置が {spread:.0f} px ばらついています"
-                         f"（同じブロックを見ていない可能性）")
+                         f"（許容 {wobble:.0f} px。同じブロックを見ていない可能性）")
         return None, detail
     return centre, detail
