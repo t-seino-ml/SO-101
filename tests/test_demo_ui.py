@@ -95,9 +95,11 @@ def test_a_panel_has_pixel_dimensions_before_any_frame_arrives(ui):
             image = ui.placeholder(size)
             label = tk.Label(root, image=image)
             label.update_idletasks()
-            assert label.winfo_reqwidth() == size[0], \
+            # Within the Label's own border, which is a couple of pixels either
+            # side. The failure this guards against is off by a factor of ten.
+            assert abs(label.winfo_reqwidth() - size[0]) <= 8, \
                 "the panel must measure in pixels, not characters"
-            assert label.winfo_reqheight() == size[1]
+            assert abs(label.winfo_reqheight() - size[1]) <= 8
     finally:
         root.destroy()
 
