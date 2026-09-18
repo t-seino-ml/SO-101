@@ -76,11 +76,12 @@ def test_the_overlay_survives_having_nothing_to_draw(ui):
     assert ui.annotate(blank, None, None).shape == blank.shape
 
 
-def test_a_panel_has_pixel_dimensions_before_any_frame_arrives(ui):
-    """Tk sizes an image-less Label in characters, which ate the pick screen.
+def test_a_panel_fills_exactly_the_space_it_was_given(ui):
+    """A placeholder that is not panel-sized leaves a hole or overruns the card.
 
-    A 470-wide panel with no image asks for 470 *characters* and pushes the
-    rest of the window off the edge - which is what happened for as long as the
+    It also has to exist at all: the panels used to be Labels, which size
+    themselves in *characters* until they hold an image, and a 470-wide one
+    asked for 470 characters and swallowed the window for as long as the
     detector took to load.
     """
     import tkinter as tk
@@ -93,21 +94,56 @@ def test_a_panel_has_pixel_dimensions_before_any_frame_arrives(ui):
         root.withdraw()
         for size in (ui.TELEOP_VIEW, ui.PICK_VIEW):
             image = ui.placeholder(size)
-            label = tk.Label(root, image=image)
-            label.update_idletasks()
-            # Within the Label's own border, which is a couple of pixels either
-            # side. The failure this guards against is off by a factor of ten.
-            assert abs(label.winfo_reqwidth() - size[0]) <= 8, \
-                "the panel must measure in pixels, not characters"
-            assert abs(label.winfo_reqheight() - size[1]) <= 8
+            assert (image.width(), image.height()) == size
     finally:
         root.destroy()
 
 
-def test_three_panels_fit_the_window_they_are_given(ui):
-    """The pick screen shows three at once; two of them off-screen is no use."""
-    needed = 3 * ui.PICK_VIEW[0] + 3 * 22      # panels plus their padding
-    assert needed <= 1560, f"three panels need {needed} px"
+@pytest.mark.parametrize("width,height", [(1560, 940), (1366, 768),
+                                          (1920, 1080), (1280, 720)])
+def test_the_pick_screen_fits_the_window_it_is_given(ui, width, height):
+    """Three panels, the colours and STOP, all on screen at every size we meet.
+
+    A panel pushed off the edge is not a cosmetic fault: the colour buttons go
+    with it, and the only way to run the demo is then the command line.
+    """
+    plan = ui.pick_layout(width, height)
+    cards = plan["row"]["cards"]
+    assert len(cards) == 3
+    assert cards[0][0] >= 0 and cards[-1][2] <= width
+    for rect in (plan["select"], plan["stop"], *cards):
+        x0, y0, x1, y1 = rect
+        assert 0 <= x0 < x1 <= width, rect
+        assert 0 <= y0 < y1 <= height, rect
+    assert cards[0][3] <= plan["select"][1], "the cards overlap the colour bar"
+    assert plan["select"][2] <= plan["stop"][0], "the colours overlap STOP"
+    image_w, image_h = plan["row"]["image"]
+    assert image_w >= 300 and image_h >= 220, \
+        f"panels shrank to {image_w}x{image_h}"
+
+
+@pytest.mark.parametrize("width,height", [(1560, 940), (1366, 768),
+                                          (1920, 1080), (1280, 720)])
+def test_the_teleop_screen_fits_the_window_it_is_given(ui, width, height):
+    plan = ui.teleop_layout(width, height)
+    cards = plan["row"]["cards"]
+    assert len(cards) == 2
+    for rect in (plan["panel"], *cards):
+        x0, y0, x1, y1 = rect
+        assert 0 <= x0 < x1 <= width, rect
+        assert 0 <= y0 < y1 <= height, rect
+    assert cards[0][3] <= plan["panel"][1]
+
+
+def test_the_panels_take_the_space_rather_than_leaving_it_blank(ui):
+    """The complaint that started the redesign: 情報量のない空白の部分.
+
+    Whatever is left after the header and the lower card belongs to the camera
+    views, so the check is that they actually claim most of the window.
+    """
+    plan = ui.pick_layout(1560, 940)
+    used = sum((x1 - x0) for x0, _, x1, _ in plan["row"]["cards"])
+    assert used >= 1560 * 0.9, f"the cards only use {used:.0f} of 1560 px"
 
 
 def test_the_view_loop_reschedules_itself_even_when_it_throws(ui):
@@ -143,11 +179,55 @@ def test_the_view_loop_reschedules_itself_even_when_it_throws(ui):
 
 
 def test_clearing_a_screen_drops_the_panels_it_owned(ui):
-    """The race that killed the loop: views outliving the widgets they name."""
+    """The race that killed the loop: views outliving the items they name."""
     import inspect
 
     source = inspect.getsource(ui.DemoApp.clear)
     before = source.index("self.views = {}")
-    after = source.index("self.screen.destroy()")
+    after = source.index('self.canvas.delete("all")')
     assert before < after, \
-        "views must be dropped before the widgets are destroyed, not after"
+        "views must be dropped before the items are deleted, not after"
+
+
+def test_a_colour_press_is_ignored_while_the_arm_is_moving(ui):
+    """Canvas items have no disabled state, so the guard has to be in code.
+
+    Greying the tiles is only paint. Without `colour_enabled` checked here, a
+    second press mid-pick would start a second worker on the same serial port.
+    """
+    class Pressed:
+        colour_enabled = False
+        worker = None
+        started = []
+        start_pick = ui.DemoApp.start_pick
+
+        def _set_buttons(self, _enabled):
+            pass
+
+        def start_worker(self, target):
+            self.started.append(target)
+
+    app = Pressed()
+    app.start_pick("red")
+    assert app.started == [], "a greyed tile must not start anything"
+
+    app.colour_enabled = True
+    app.start_pick("red")
+    assert len(app.started) == 1
+
+
+def test_stop_does_nothing_when_there_is_nothing_to_stop(ui):
+    """Otherwise an idle press latches the flag and kills the next run."""
+    class Idle:
+        colour_enabled = True
+        request_stop = ui.DemoApp.request_stop
+
+        class stop_flag:
+            set_called = False
+
+            @classmethod
+            def set(cls):
+                cls.set_called = True
+
+    Idle().request_stop()
+    assert not Idle.stop_flag.set_called
