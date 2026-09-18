@@ -45,6 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from so101.demo.trajectory import (  # noqa: E402
     ARM_JOINTS,
+    connect,
     SLOT_DIR,
     Trajectory,
     Unsafe,
@@ -235,7 +236,7 @@ def main():
         created=datetime.now().astimezone().isoformat(timespec="seconds"),
         note="taught with the leader arm; joint angles only")
     try:
-        robot.connect()
+        connect(robot, follower_port)
         print("\n  接続しました。リーダで動かせます。")
         for phase, hint, seconds, _ in plan:
             pose = drive_until_enter(robot, teleop, phase, hint)

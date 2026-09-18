@@ -43,6 +43,7 @@ for _stream in (sys.stdout, sys.stderr):
 from so101.demo.slots import SlotMap, steady_centre  # noqa: E402
 from so101.demo.trajectory import (  # noqa: E402
     ARM_JOINTS,
+    connect,
     SLOT_DIR,
     Trajectory,
     Unsafe,
@@ -252,7 +253,7 @@ def main():
     try:
         robot = make_robot_from_config(SO101FollowerConfig(
             port=port, id="follower"))
-        robot.connect()
+        connect(robot, port, log=log)
         log("\n  接続しました。トルクが入っています。")
         began = time.perf_counter()
         record["waypoints"] = play(robot, trajectory, log=log,

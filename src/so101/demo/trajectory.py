@@ -380,6 +380,38 @@ def health(robot):
             grip)
 
 
+def connect(robot, port="COM4", attempts=3, log=print):
+    """Connect the arm, retrying a garbled reply.
+
+    `robot.connect()` writes a dozen registers to each servo before it hands
+    back - gains, operating mode, the gripper's torque limits - and one dropped
+    status packet in the middle of that raises. It happened on D_Coefficient to
+    the gripper with the arm sitting idle and healthy. bus_patch's retries do
+    not reach the path, and an exhibition should not end at the connect.
+
+    A failed attempt is disconnected before the next, because a half-configured
+    bus will refuse to be connected again.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            robot.connect()
+            return
+        except Exception as error:  # noqa: BLE001 - any failure is worth a retry
+            log(f"  接続 {attempt}/{attempts} 回目が失敗: "
+                f"{type(error).__name__}: {error}")
+            try:
+                robot.disconnect()
+            except Exception:  # noqa: BLE001 - it may never have opened
+                pass
+            if attempt == attempts:
+                raise SystemExit(
+                    f"\n  アーム({port}) に接続できません。\n"
+                    "  電源と USB を確認してください。読み取りだけなら\n"
+                    f"    uv run scripts/diag.py {port}\n"
+                    "  で応答が見えます。\n")
+            time.sleep(1.5)
+
+
 def freeze(robot, log=print):
     """Hold where the arm is, not where it was last told to be.
 

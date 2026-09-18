@@ -501,3 +501,41 @@ def test_the_ambiguity_margin_follows_the_layout():
     for name, centre in slots.slots.items():
         assert slots.nearest(centre)[0] == name
         assert not slots.ambiguous(centre), f"{name} reads as ambiguous"
+
+
+def test_the_connect_retries_a_garbled_reply():
+    """connect() writes a dozen registers; one dropped packet used to end a run."""
+    from so101.demo.trajectory import connect
+
+    class Sticky:
+        def __init__(self):
+            self.attempts = 0
+            self.disconnects = 0
+
+        def connect(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError(
+                    "Failed to write 'D_Coefficient' on id_=6")
+
+        def disconnect(self):
+            self.disconnects += 1
+
+    robot = Sticky()
+    connect(robot, "COM4", log=lambda *_: None)
+    assert robot.attempts == 2
+    assert robot.disconnects == 1, "a half-configured bus must be closed first"
+
+
+def test_the_connect_gives_up_and_says_where_to_look():
+    from so101.demo.trajectory import connect
+
+    class Dead:
+        def connect(self):
+            raise ConnectionError("no status packet")
+
+        def disconnect(self):
+            pass
+
+    with pytest.raises(SystemExit, match="diag.py"):
+        connect(Dead(), "COM4", attempts=2, log=lambda *_: None)
