@@ -86,7 +86,13 @@ ACCENT = "#4fa3ff"
 GOOD = "#57c785"
 BAD = "#ff6b6b"
 
-VIEW_W, VIEW_H = 384, 288
+#: Panel sizes, per screen. Tk's Label sizes itself in *characters* until it
+#: has an image, so every panel is given a placeholder of the right pixel size
+#: the moment it is built - without one, a 470-wide label asks for 470
+#: characters and swallows the window, which is exactly what the pick screen
+#: did while it waited for the detector to load.
+TELEOP_VIEW = (600, 450)
+PICK_VIEW = (470, 352)
 DETECT_HZ = 3.0
 
 
@@ -103,16 +109,33 @@ class Update:
 # drawing
 # -------------------------------------------------------------------------
 
-def to_photo(image, width=VIEW_W, height=VIEW_H):
+def to_photo(image, size):
     """An OpenCV BGR frame as something Tk can put in a Label."""
     import cv2
     from PIL import Image, ImageTk
 
     if image is None:
         return None
-    frame = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+    frame = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
     return ImageTk.PhotoImage(
         Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+
+
+def placeholder(size, text="カメラを準備しています…"):
+    """A panel-sized image to hold the layout open until a frame arrives.
+
+    Not cosmetic. Without an image a Label measures itself in characters, so a
+    panel asking to be 470 wide asks for 470 characters and pushes everything
+    else off the window - which is what the pick screen did for as long as the
+    detector took to load.
+    """
+    import cv2
+    import numpy as np
+
+    canvas = np.full((size[1], size[0], 3), 18, np.uint8)
+    cv2.putText(canvas, text, (18, size[1] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 150, 180), 1)
+    return to_photo(canvas, size)
 
 
 def annotate(image, detections, slot_map, chosen=None):
@@ -154,7 +177,14 @@ class DemoApp(tk.Tk):
         super().__init__()
         self.title("SO-101 デモ")
         self.configure(bg=BACKGROUND)
-        self.geometry("1180x760")
+        # Sized to the screen rather than to a guess: three panels and their
+        # padding need about 1500 px, and a window narrower than its contents
+        # hides the buttons rather than shrinking them.
+        width = min(1560, self.winfo_screenwidth() - 80)
+        height = min(940, self.winfo_screenheight() - 80)
+        self.geometry(f"{width}x{height}+40+20")
+        self.bind("<F11>", self._fullscreen)
+        self.bind("<Escape>", lambda _event: self.attributes("-fullscreen", False))
         self.follower_port = follower_port
         self.leader_port = leader_port
 
@@ -177,7 +207,24 @@ class DemoApp(tk.Tk):
         self.after(50, self._drain)
         self.after(60, self._refresh_views)
         self.protocol("WM_DELETE_WINDOW", self.close)
-        threading.Thread(target=self._open_cameras, daemon=True).start()
+        threading.Thread(target=self._start_up, daemon=True).start()
+
+    def _fullscreen(self, _event=None):
+        self.attributes("-fullscreen", not self.attributes("-fullscreen"))
+
+    def _start_up(self):
+        """Open the cameras, then load the detector, before either is asked for.
+
+        The detector takes several seconds the first time - CUDA context, graph
+        setup, the warmup pass - and doing it when the pick screen opens meant
+        the pick screen opened onto nothing. It is loaded here instead, while
+        somebody is still reading the home screen.
+        """
+        self._open_cameras()
+        try:
+            self._load_detector()
+        except Exception as error:  # noqa: BLE001
+            self.updates.put(Update("detail", f"検出モデルを読めません: {error}"))
 
     # -- shared resources -------------------------------------------------
 
@@ -226,7 +273,7 @@ class DemoApp(tk.Tk):
         page = self.clear()
         self.mode = "home"
         tk.Label(page, text="SO-101 デモ", font=self.big, bg=BACKGROUND,
-                 fg=TEXT).pack(pady=(40, 6))
+                 fg=TEXT).pack(pady=(60, 6))
         tk.Label(page, text="どちらのモードで動かしますか", font=self.mid,
                  bg=BACKGROUND, fg=MUTED).pack(pady=(0, 40))
 
@@ -256,18 +303,21 @@ class DemoApp(tk.Tk):
             widget.bind("<Button-1>", lambda _event: command())
         return box
 
-    def _views(self, parent, roles, extra=None):
+    def _views(self, parent, roles, size):
         """A row of live camera panels. Returns {name: Label}."""
+        self.view_size = size
         row = tk.Frame(parent, bg=BACKGROUND)
-        row.pack(pady=(4, 10))
+        row.pack(pady=(2, 6))
         labels = {}
-        for name, caption in list(roles.items()) + list((extra or {}).items()):
+        for name, caption in roles.items():
             column = tk.Frame(row, bg=PANEL)
-            column.pack(side="left", padx=8)
+            column.pack(side="left", padx=6)
             tk.Label(column, text=caption, font=self.small, bg=PANEL,
-                     fg=MUTED).pack(pady=(6, 2))
-            view = tk.Label(column, bg="#000000", width=VIEW_W, height=VIEW_H)
-            view.pack(padx=6, pady=(0, 6))
+                     fg=MUTED).pack(pady=(4, 2))
+            blank = placeholder(size)
+            view = tk.Label(column, image=blank, bg="#000000")
+            view.pack(padx=5, pady=(0, 5))
+            self._photos[name] = blank      # Tk drops what it cannot see
             labels[name] = view
         return labels
 
@@ -289,7 +339,8 @@ class DemoApp(tk.Tk):
         self.mode = "teleop"
         self._header(page, "リーダ機で動かす")
         self.views = self._views(page, {"side": "外付けカメラ",
-                                        "wrist": "アームのカメラ"})
+                                        "wrist": "アームのカメラ"},
+                                 TELEOP_VIEW)
         self.state = tk.Label(page, text="準備しています…", font=self.mid,
                               bg=BACKGROUND, fg=ACCENT)
         self.state.pack(pady=(6, 2))
@@ -368,8 +419,8 @@ class DemoApp(tk.Tk):
         self.mode = "pick"
         self._header(page, "ブロックをつかむ")
         self.views = self._views(
-            page, {"side": "外付けカメラ", "wrist": "アームのカメラ"},
-            extra={"detect": "カメラが見ているもの"})
+            page, {"side": "外付けカメラ", "wrist": "アームのカメラ",
+                   "detect": "カメラが見ているもの"}, PICK_VIEW)
 
         self.state = tk.Label(page, text="色をえらんでください", font=self.big,
                               bg=BACKGROUND, fg=ACCENT)
@@ -560,11 +611,11 @@ class DemoApp(tk.Tk):
         self.after(60, self._refresh_views)
 
     def _show(self, name, image):
-        photo = to_photo(image)
+        photo = to_photo(image, self.view_size)
         if photo is None:
             return
         self._photos[name] = photo         # Tk drops what it cannot see
-        self.views[name].configure(image=photo, width=VIEW_W, height=VIEW_H)
+        self.views[name].configure(image=photo)
 
     def _show_detection(self):
         image = self.frame("side")

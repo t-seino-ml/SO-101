@@ -74,3 +74,35 @@ def test_the_overlay_draws_the_slots_and_the_detections(ui):
 def test_the_overlay_survives_having_nothing_to_draw(ui):
     blank = np.zeros((600, 800, 3), np.uint8)
     assert ui.annotate(blank, None, None).shape == blank.shape
+
+
+def test_a_panel_has_pixel_dimensions_before_any_frame_arrives(ui):
+    """Tk sizes an image-less Label in characters, which ate the pick screen.
+
+    A 470-wide panel with no image asks for 470 *characters* and pushes the
+    rest of the window off the edge - which is what happened for as long as the
+    detector took to load.
+    """
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    try:
+        root.withdraw()
+        for size in (ui.TELEOP_VIEW, ui.PICK_VIEW):
+            image = ui.placeholder(size)
+            label = tk.Label(root, image=image)
+            label.update_idletasks()
+            assert label.winfo_reqwidth() == size[0], \
+                "the panel must measure in pixels, not characters"
+            assert label.winfo_reqheight() == size[1]
+    finally:
+        root.destroy()
+
+
+def test_three_panels_fit_the_window_they_are_given(ui):
+    """The pick screen shows three at once; two of them off-screen is no use."""
+    needed = 3 * ui.PICK_VIEW[0] + 3 * 22      # panels plus their padding
+    assert needed <= 1560, f"three panels need {needed} px"
