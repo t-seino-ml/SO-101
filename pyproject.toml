@@ -1,7 +1,7 @@
 [project]
 name = "so101"
 version = "0.1.0"
-description = "SO-101 imitation-learning stack: hardware bring-up, camera, dataset, policy, and an integrated app"
+description = "SO-101 exhibition demo: hardware bring-up, camera, block detection, and a touch-screen pick-and-place"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "lerobot[feetech]",
@@ -14,25 +14,13 @@ dependencies = [
     # for a project's own dependencies, not for ones pulled in transitively.
     "torch",
     "torchvision",
-    # Inverse kinematics from the URDF. LeRobot's RobotKinematics uses placo, which
-    # publishes no Windows wheels; ikpy is pure Python and solves this arm exactly.
-    "ikpy",
-    # Geometry and kinematics are checked against a MuJoCo twin before anything
-    # touches the arm: a real trial costs half a minute, a simulated one costs a
-    # millisecond. The MJCF comes from the same CAD as the URDF and agrees with
-    # it to 0.004 mm - see scripts/sim_check_fk.py.
-    "mujoco",
-    # Text encoder for YOLO-World, which finds the can without anything having
-    # been trained on it. Not on PyPI under this name; this is Ultralytics' fork.
-    "clip",
 ]
 
-# LeRobot pulls the CPU build of torch. This machine has an RTX 4060, and both
-# YOLO and ACT training are impractical without it.
+# LeRobot pulls the CPU build of torch. This machine has an RTX 4060, and
+# training the block detector is impractical without it.
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
 torchvision = [{ index = "pytorch-cu128" }]
-clip = { git = "https://github.com/ultralytics/CLIP.git" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

@@ -1,24 +1,16 @@
-"""Perception-to-motion for the block task.
+"""Where a block is, from the side camera.
 
-- `kinematics`   forward and inverse kinematics via ikpy and the SO-101 URDF
-- `table_frame`  homography from camera pixels to the arm's own coordinates
-- `auto_calibrate`  fits that homography by watching the arm carry a block
-- `detector`     the trained block detector, with this rig's inference settings
-- `pick_place`   scripted pick-and-place, which will also generate the episodes
-                 a policy is later trained on
+- `detector`  the trained block detector, with this rig's inference settings
 
-The split is deliberate: the detector says where a block is, the homography turns
-that into a reachable position, and kinematics gets the arm there. Nothing has to
-learn perception and control jointly, which is what makes a small dataset enough.
+That is all this package does now. It used to carry the rest of a pick as well -
+inverse kinematics, a pixels-to-table homography, a TCP model, visual servoing -
+and the exhibition does none of it: a colour picks the nearest taught slot in
+pixel space, and the arm replays joint angles a person taught it. The detector
+answers "which colour is where on screen", and nothing downstream needs metres.
+
+The removed modules are in the history if that approach is picked up again.
 """
 
-from .detector import BlockDetector, find_weights, Detection
-from .pick_place import PickPlace, PickResult
-from .approach import ApproachPoses
-from .kinematics import ArmKinematics
-from .table_frame import TableFrame
+from .detector import BlockDetector, Detection, find_weights
 
-__all__ = ["ArmKinematics", "ApproachPoses",
-    "BlockDetector",
-    "find_weights", "Detection", "PickPlace",
-           "PickResult", "TableFrame"]
+__all__ = ["BlockDetector", "Detection", "find_weights"]

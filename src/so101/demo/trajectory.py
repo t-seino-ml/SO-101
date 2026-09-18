@@ -50,8 +50,8 @@ DEFAULT_SETTLE_S = 0.35
 #: Within this of a waypoint counts as reached, *after* the sag has been
 #: corrected for. Commanding a joint angle does not produce that joint angle:
 #: the follower settles short under its own weight, with no integral term to
-#: close the gap - `so101.policy.motion` says the same thing about Cartesian
-#: moves and measured most of a centimetre. Measured here: elbow_flex 2.6 deg
+#: close the gap. The Cartesian mover this repository used to carry measured
+#: most of a centimetre of the same sag. Measured here: elbow_flex 2.6 deg
 #: short at PREGRASP, arm extended forward.
 #: 1.5 was too tight to be useful. After a correction the joints land within a
 #: degree, but a waypoint that only moves a degree or two never gets going -
@@ -85,8 +85,8 @@ STUCK_MIN_DEG = 3.0
 #: closes the jaws to the block and no further, which is not a grip - the servo
 #: has arrived and stops pushing. So the command goes past it and the block
 #: stops the jaws instead, which is what holding something is. This is what
-#: `so101.policy.motion.GRIP_DEG` has always meant by "squeezed past where a
-#: block stops the jaws"; the gripper's own Max_Torque_Limit and
+#: "squeezed past where a block stops the jaws" has always meant on this
+#: gripper; its own Max_Torque_Limit and
 #: Protection_Current are set low by LeRobot precisely so this is safe.
 SQUEEZE_DEG = 15.0
 #: A drop in the taught gripper angle bigger than this is a close, rather than
@@ -111,8 +111,8 @@ RELEASING_PHASES = ("DROP", "OPEN", "RETURN", "HOME")
 #: closed on air.
 HOLDING_MARGIN_DEG = 4.0
 
-#: Of 1023, and for the arm joints only. `so101.policy.motion` aborts at 700;
-#: this is lower because a taught trajectory should meet nothing at all -
+#: Of 1023, and for the arm joints only. The scripted Cartesian mover aborted
+#: at 700; this is lower because a taught trajectory should meet nothing -
 #: anything an *arm* joint meets is a surprise.
 #:
 #: The gripper is not in that list, and must not be. It is supposed to push: a
@@ -344,6 +344,25 @@ def _retrying(what, attempts=READ_ATTEMPTS):
             time.sleep(READ_PAUSE_S)
 
 
+def glide_to(robot, goal, seconds=2.0, fps=30):
+    """Interpolate to `goal` over `seconds` rather than commanding it outright.
+
+    A servo handed a distant goal goes at whatever speed its P gain produces,
+    which on this arm is fast enough to be alarming next to a visitor. Feeding
+    it the line in small steps makes the speed ours rather than the gain's.
+
+    This came from the scripted Cartesian mover, which is the only thing the
+    replay ever used out of it.
+    """
+    start = joints_of(robot)
+    steps = max(1, int(seconds * fps))
+    for step in range(1, steps + 1):
+        robot.send_action({f"{name}.pos": start[name]
+                           + (goal[name] - start[name]) * step / steps
+                           for name in goal})
+        time.sleep(1.0 / fps)
+
+
 def joints_of(robot):
     """The arm's pose, as {joint: degrees}."""
     observation = _retrying(robot.get_observation)
@@ -492,8 +511,6 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
     command outside the servo's own stops. Optional, and only because the
     correction is already capped at MAX_CORRECTION_DEG from the taught angle.
     """
-    from ..policy.motion import glide_to
-
     grips = squeeze_plan(trajectory, gripper_min=(
         limits["gripper"]["min_deg"] + 1.0 if limits and "gripper" in limits
         else None))

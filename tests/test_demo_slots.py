@@ -155,10 +155,8 @@ class BlockedRobot(FakeRobot):
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
     import so101.demo.trajectory as module
-    import so101.policy.motion as motion
 
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(motion.time, "sleep", lambda seconds: None)
 
 
 def test_play_walks_the_whole_trajectory():
