@@ -35,14 +35,17 @@ uv run scripts/find_cameras.py --no-preview
 ### 5. Slot を登録し直す（**明日やる校正はこれだけ**）
 
 ```powershell
-uv run scripts/calibrate_demo_slots.py --detect
+uv run scripts/calibrate_demo_slots.py --slots 6 --detect
 ```
 
-カメラ画像が開くので、**Slot1 → Slot2 → Slot3 の順に中心をクリック** → ENTER で保存。
+カメラ画像が開くので、**Slot1 から Slot6 まで順に中心をクリック** → ENTER で保存。
 
 - `BACKSPACE` で 1 つ取り消し、`ESC` で中止
 - 各 Slot に描かれる円が「この中なら同じ Slot」の範囲です
-- 円どうしが重なると警告が出ます。重なったら Slot を離すか `--radius` を小さく
+- **円が重なる場合は自動で半径を詰めます。** 手で計算する必要はありません
+
+クリックの順番が Slot 番号になります。`data/demo_slots/slot1.json` を教示した場所を
+最初にクリックしてください。
 
 ### 6. 見えているか確認
 
@@ -71,6 +74,9 @@ uv run scripts/demo_slot_pick.py --color blue
 ```
 
 カメラが blue を探し、どの Slot にあるか判定して、その軌道を実行します。
+**色と Slot の対応は固定していません。** ブロックを入れ替えれば、そのとおりに追随します。
+
+Slot は 6 つあります（`--slot 1` 〜 `--slot 6`）。
 
 ### Level 2 — Slot 判定が怪しいとき
 
@@ -108,7 +114,8 @@ uv run scripts/demo_slot_pick.py --slot 3
 | 表示 | 意味 | 対処 |
 |---|---|---|
 | `blue のブロックが見つかりません` | その色が見えていない | ブロックを置く／照明を明るく |
-| `blue のブロックが 2 個見えます` | 同じ色が複数ある | 1 個だけにする |
+| `blue のブロックが Slot の上に見つかりません` | 色は見えるが Slot の外 | Slot の印に合わせて置く |
+| `Slot の上に 2 個あります` | 同じ色が 2 つの Slot にある | 1 個だけにする（Slot の外にある分は無視されます） |
 | `いちばん近い Slot まで N px あります` | ブロックが Slot の上にない | Slot の印に合わせて置き直す |
 | `slot1 と slot2 のちょうど中間にあります` | どちらか判断できない | Slot の中心へ寄せる |
 | `検出位置が N px ばらついています` | 検出が不安定 | 照明／カメラの固定を確認 |
@@ -150,7 +157,7 @@ uv run scripts/demo_slot_pick.py --slot 3
   ↓
 学習済み YOLO が指定色のブロックを検出（7 枚の中央値をとる）
   ↓
-画像上で、3 つの Slot のうちどれに近いか判定
+画像上で、6 つの Slot のうちどれに近いか判定
   ↓
 その Slot 用の「人が教えた軌道」を再生
   ↓
@@ -160,7 +167,9 @@ Pick → 缶へ運ぶ → Drop → Home
 **ロボットの動きは計算していません。** 人がリーダアームで動かして「ここ」と教えた
 関節角度を、そのまま再生しています。だからカメラが動いても動きは変わりません。
 
-カメラがやっているのは「**3 つのうちどれか**」を選ぶことだけです。
+カメラがやっているのは「**6 つのうちどれか**」を選ぶことだけです。
+
+Slot の外に置いてあるブロック（予備、缶の中、机の隅）は候補に入りません。
 
 ---
 
@@ -168,7 +177,7 @@ Pick → 缶へ運ぶ → Drop → Home
 
 | | 内容 |
 |---|---|
-| `data/demo_slots/slot1.json` 〜 `slot3.json` | 教示した軌道（**これが本体。消さないこと**） |
+| `data/demo_slots/slot1.json` 〜 `slot6.json` | 教示した軌道（**これが本体。消さないこと**） |
 | `data/demo_slot_calibration.json` | Slot の画像上の位置（明日更新する唯一のファイル） |
 | `outputs/demo/<日時>/` | 実行ごとの記録（見たもの・選んだ Slot・全 waypoint・負荷） |
 
