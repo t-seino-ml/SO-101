@@ -108,3 +108,46 @@ def test_three_panels_fit_the_window_they_are_given(ui):
     """The pick screen shows three at once; two of them off-screen is no use."""
     needed = 3 * ui.PICK_VIEW[0] + 3 * 22      # panels plus their padding
     assert needed <= 1560, f"three panels need {needed} px"
+
+
+def test_the_view_loop_reschedules_itself_even_when_it_throws(ui):
+    """A display loop that stops rescheduling does not fail visibly.
+
+    It happened: `clear()` destroyed the widgets, the 60 ms timer fired before
+    the replacements existed, one TclError ended the loop, and every camera
+    view on every screen stopped updating for the rest of the session with
+    nothing on screen to say so.
+    """
+    import tkinter as tk
+
+    class Exploding:
+        """Enough of the app for the loop, with a panel that always throws."""
+
+        views = {"side": object()}          # not a widget: `_show` will throw
+        rescheduled = 0
+
+        def after(self, _ms, _fn):
+            self.rescheduled += 1
+
+        def frame(self, _role):
+            return None
+
+        _show = ui.DemoApp._show
+        _refresh_views = ui.DemoApp._refresh_views
+        updates = None
+
+    app = Exploding()
+    app.updates = type("Q", (), {"put": staticmethod(lambda _u: None)})()
+    app._refresh_views()
+    assert app.rescheduled == 1, "the loop must survive its own failure"
+
+
+def test_clearing_a_screen_drops_the_panels_it_owned(ui):
+    """The race that killed the loop: views outliving the widgets they name."""
+    import inspect
+
+    source = inspect.getsource(ui.DemoApp.clear)
+    before = source.index("self.views = {}")
+    after = source.index("self.screen.destroy()")
+    assert before < after, \
+        "views must be dropped before the widgets are destroyed, not after"

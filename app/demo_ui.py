@@ -262,6 +262,10 @@ class DemoApp(tk.Tk):
 
     def clear(self):
         self.stop_worker()
+        # Before the widgets go, not after. The refresh timer fires every 60 ms
+        # and would otherwise find `self.views` pointing at destroyed Labels.
+        self.views = {}
+        self.detections = []
         if self.screen is not None:
             self.screen.destroy()
         self.screen = tk.Frame(self, bg=BACKGROUND)
@@ -575,7 +579,20 @@ class DemoApp(tk.Tk):
         self.worker = None
 
     def _drain(self):
-        """Whatever the worker has said since last time. Main thread only."""
+        """Whatever the worker has said since last time. Main thread only.
+
+        Rescheduled in a `finally`, like `_refresh_views`, and for the same
+        reason: a loop that stops rescheduling itself when something goes wrong
+        does not fail visibly, it just quietly stops being a program.
+        """
+        try:
+            self._drain_once()
+        except Exception:  # noqa: BLE001 - never let the loop die
+            pass
+        finally:
+            self.after(50, self._drain)
+
+    def _drain_once(self):
         try:
             while True:
                 update = self.updates.get_nowait()
@@ -599,18 +616,31 @@ class DemoApp(tk.Tk):
                         self.chosen_slot = None
         except queue.Empty:
             pass
-        self.after(50, self._drain)
 
     def _refresh_views(self):
-        if getattr(self, "views", None):
+        """Put the newest frame in every panel.
+
+        The reschedule is in a `finally` because it used to be the last
+        statement: one TclError from a Label destroyed a moment earlier ended
+        the loop, and every camera view on every screen stopped updating for
+        the rest of the session with no error anybody would see.
+        """
+        try:
             for role in ("side", "wrist"):
                 if role in self.views:
                     self._show(role, self.frame(role))
             if "detect" in self.views:
                 self._show_detection()
-        self.after(60, self._refresh_views)
+        except tk.TclError:
+            pass        # a widget went away mid-update; the next screen has its own
+        except Exception as error:  # noqa: BLE001
+            self.updates.put(Update("detail", f"表示: {error}"))
+        finally:
+            self.after(60, self._refresh_views)
 
     def _show(self, name, image):
+        if name not in self.views or not self.views[name].winfo_exists():
+            return
         photo = to_photo(image, self.view_size)
         if photo is None:
             return
