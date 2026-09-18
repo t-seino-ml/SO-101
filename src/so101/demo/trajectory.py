@@ -482,7 +482,10 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
         opening = dict(point.joints)
         if grip is not None:
             opening["gripper"] = grip
-        glide_to(robot, opening, seconds=seconds, fps=FPS)
+        # Retried as a whole, which is safe because it re-reads where the arm
+        # is and interpolates from there: a glide interrupted partway simply
+        # starts again from wherever it got to.
+        _retrying(lambda: glide_to(robot, opening, seconds=seconds, fps=FPS))
         time.sleep(point.settle_s)
 
         # Aim, look at where it actually went, and add the miss back into the
@@ -530,7 +533,8 @@ def play(robot, trajectory, log=print, on_sample=None, speed=1.0,
             command = dict(aim)
             if grip is not None:
                 command["gripper"] = grip
-            glide_to(robot, command, seconds=SETTLE_SECONDS, fps=FPS)
+            _retrying(lambda: glide_to(robot, command,
+                                       seconds=SETTLE_SECONDS, fps=FPS))
             time.sleep(point.settle_s)
 
         record = {
