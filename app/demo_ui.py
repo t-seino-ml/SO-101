@@ -199,15 +199,45 @@ def to_photo(image, size):
         Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
 
 
+def _wrap(draw, text, font, pixels):
+    """Break `text` to fit `pixels`, per character - Japanese has no spaces."""
+    lines, line = [], ""
+    for character in text:
+        if draw.textlength(line + character, font=font) > pixels:
+            lines.append(line)
+            line = character
+        else:
+            line += character
+    return (lines + [line])[:6]
+
+
 def placeholder(size, text="カメラを準備しています…"):
-    """A panel-sized image to hold the panel open until a frame arrives."""
+    """A panel-sized image, carrying whatever the panel has to say.
+
+    It holds the panel open before the first frame, and it is also where a
+    camera's failure is reported: a black rectangle tells nobody that the side
+    camera is unplugged, and that is the one fault most likely to happen while
+    the exhibition is being set up.
+    """
     import cv2
     import numpy as np
 
     canvas = np.full((size[1], size[0], 3), 12, np.uint8)
-    cv2.putText(canvas, text, (18, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (120, 150, 180), 1)
-    return to_photo(canvas, size)
+    font = _japanese_font(16)
+    if font is None:
+        cv2.putText(canvas, text, (18, size[1] // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (120, 150, 180), 1)
+        return to_photo(canvas, size)
+    from PIL import Image, ImageDraw
+
+    picture = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(picture)
+    lines = _wrap(draw, text, font, size[0] - 44)
+    y = size[1] / 2 - len(lines) * 12
+    for line in lines:
+        draw.text((22, y), line, font=font, fill=(150, 176, 205))
+        y += 25
+    return to_photo(cv2.cvtColor(np.array(picture), cv2.COLOR_RGB2BGR), size)
 
 
 _FONTS = {}
@@ -344,17 +374,20 @@ class DemoApp(tk.Tk):
         self.detector = None
         self.slot_map = None
         self.detections = []
+        self.camera_faults = {}    # role -> why that panel is dark
         self.views = {}            # role -> canvas image item
         self.items = {}            # name -> canvas item, for the text we change
         self.tiles = {}
         self.view_size = PICK_VIEW
         self.colour_enabled = False
         self.mode = "home"
+        self.state_width = 600
         self.detail_text = ""
         self.pill_at = self.detail_at = self.pill_left = None
         self._photos = {}          # kept alive; Tk drops images it cannot see
         self._last_detect = 0.0
         self._live = set()         # panels that have shown a real frame
+        self._faulted = set()      # panels already carrying their fault
         self._size = (width, height)
         self._resize_job = None
 
@@ -406,16 +439,61 @@ class DemoApp(tk.Tk):
     # -- shared resources -------------------------------------------------
 
     def _open_cameras(self):
+        """Open each camera on its own, and keep whichever ones answer.
+
+        CameraSet.start() gives up on the first failure, so an unplugged side
+        camera used to leave `self.cameras` as None and *both* panels black -
+        including the wrist camera, which was working. Worse, the reason went to
+        the detail line and the next message overwrote it, so the screen said
+        nothing at all about a camera that was simply not plugged in.
+        """
         from so101.camera import CameraSet
 
         try:
             cameras = CameraSet.from_config()
-            cameras.start()
-            cameras.wait_for_frames(timeout=25)
-            self.cameras = cameras
-            self.updates.put(Update("detail", "カメラ準備完了"))
         except Exception as error:  # noqa: BLE001
-            self.updates.put(Update("detail", f"カメラを開けません: {error}"))
+            self.updates.put(Update("detail", f"cameras.json を読めません: {error}"))
+            return
+
+        working = {}
+        for role, stream in cameras.streams.items():
+            try:
+                stream.start()
+                stream.wait_for_frame(timeout=20)
+                working[role] = stream
+            except Exception as error:  # noqa: BLE001
+                self.camera_faults[role] = self._camera_fault(role, error)
+                try:
+                    stream.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        cameras.streams = working
+        self.cameras = cameras
+        if not working:
+            self.updates.put(Update("detail", "カメラが 1 台も開きません"))
+        elif self.camera_faults:
+            self.updates.put(Update(
+                "detail", "  /  ".join(self.camera_faults.values())))
+        else:
+            self.updates.put(Update("detail", "カメラ準備完了"))
+
+    @staticmethod
+    def _camera_fault(role, error):
+        """What to print on a dead panel: the fault, then what to do about it."""
+        from so101.camera.config import load
+
+        where = {"side": "外付けカメラ", "wrist": "アームのカメラ"}.get(role, role)
+        try:
+            wanted = load()[role].name
+        except Exception:  # noqa: BLE001
+            wanted = role
+        if isinstance(error, LookupError):
+            return (f"{where}（{wanted}）が見つかりません。"
+                    f"USB を挿し直してアプリを再起動してください")
+        if isinstance(error, TimeoutError):
+            return (f"{where}（{wanted}）は見えていますが映像が来ません。"
+                    f"他のアプリが使っていないか確認してください")
+        return f"{where}（{wanted}）を開けません: {type(error).__name__}"
 
     def _load_detector(self):
         if self.detector is not None:
@@ -453,6 +531,7 @@ class DemoApp(tk.Tk):
         self.canvas.delete("all")
         self._photos.clear()
         self._live.clear()
+        self._faulted.clear()
         self.pill_at = self.detail_at = self.pill_left = None
         width, height = self.size()
         theme.gradient(self.canvas, 0, 0, width, height, theme.DEEP, theme.NIGHT)
@@ -530,7 +609,8 @@ class DemoApp(tk.Tk):
                                 anchor="w", font=self.f_card, fill=theme.TEXT)
         self.canvas.create_text(x1 - pad - 2, y0 + head / 2, text=spaced(tag),
                                 anchor="e", font=self.f_tag, fill=theme.FAINT)
-        blank = placeholder(image_size)
+        fault = self.camera_faults.get(role)
+        blank = placeholder(image_size, fault) if fault else placeholder(image_size)
         self._photos[role] = blank
         self.views[role] = self.canvas.create_image(
             x0 + pad, y0 + head + pad, image=blank, anchor="nw")
@@ -643,6 +723,7 @@ class DemoApp(tk.Tk):
                       outline=theme.EDGE)
         self.canvas.create_text(x0 + 26, y0 + 26, text=spaced("01 / TELEOP"),
                                 anchor="w", font=self.f_tag, fill=theme.FAINT)
+        self.state_width = x1 - x0 - 52 - 200
         self.items["state"] = self.canvas.create_text(
             x0 + 26, y0 + 62, text="準備しています…", anchor="w",
             font=self.f_state, fill=theme.WARN)
@@ -757,6 +838,7 @@ class DemoApp(tk.Tk):
         self.canvas.create_text(x0 + 26, y0 + 26,
                                 text=spaced("01 / SELECT COLOR"), anchor="w",
                                 font=self.f_tag, fill=theme.FAINT)
+        self.state_width = x1 - x0 - 52
         self.items["state"] = self.canvas.create_text(
             x0 + 26, y0 + 62, text="色をえらんでください", anchor="w",
             font=self.f_state, fill=theme.TEXT)
@@ -973,8 +1055,10 @@ class DemoApp(tk.Tk):
         """
         self._pill(text, colour)
         if "state" in self.items:
-            self.canvas.itemconfigure(self.items["state"], text=text,
-                                      fill=colour)
+            self.canvas.itemconfigure(
+                self.items["state"],
+                text=self._fit(text, self.f_state, self.state_width),
+                fill=colour)
 
     def _detail(self, text):
         self.detail_text = text
@@ -1034,7 +1118,11 @@ class DemoApp(tk.Tk):
         """
         try:
             for role in ("side", "wrist"):
-                if role in self.views:
+                if role not in self.views:
+                    continue
+                if role in self.camera_faults:
+                    self._show_fault(role)
+                else:
                     self._show(role, self.frame(role))
             if "detect" in self.views:
                 self._show_detection()
@@ -1058,6 +1146,24 @@ class DemoApp(tk.Tk):
             self._live.add(name)
             self.canvas.itemconfigure(badge, text=spaced("LIVE"),
                                       fill="#cfe0ff")
+
+    def _show_fault(self, role):
+        """Say on the panel itself why it is dark. Once - it does not change.
+
+        The reason used to go to the detail line, where the next message from a
+        worker painted over it, so an unplugged camera showed as a black
+        rectangle and nothing else.
+        """
+        if role in self._faulted:
+            return
+        self._faulted.add(role)
+        photo = placeholder(self.view_size, self.camera_faults[role])
+        self._photos[role] = photo
+        self.canvas.itemconfigure(self.views[role], image=photo)
+        badge = self.items.get(f"live:{role}")
+        if badge is not None:
+            self.canvas.itemconfigure(badge, text=spaced("NO SIGNAL"),
+                                      fill=theme.BAD)
 
     def _show_detection(self):
         image = self.frame("side")
